@@ -40,8 +40,13 @@ const db = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSes
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const ts = () => new Date().toLocaleTimeString();
 
-// task_id -> chat_id: какие задачи ждём и куда вернуть результат
+// task_id -> { chatId, doneSince }: какие задачи ждём и куда вернуть результат.
+// doneSince — момент, когда задача впервые стала done (для предохранителя ниже).
 const pending = new Map();
+
+// Сколько ждать принятия Критиком, прежде чем прислать ответ всё равно
+// (предохранитель на случай, если Критик не запущен).
+const REVIEW_WAIT_MS = 30000;
 
 // --- вызов Telegram API ---
 async function tg(method, payload) {
@@ -79,21 +84,41 @@ function extractResult(desc) {
   return rest.trim() || 'Готово ✅';
 }
 
-// --- следим за выполнением: как только задача готова — шлём результат в чат ---
+// --- следим за выполнением: шлём результат в чат, когда задача ГОТОВА и
+//     ПРИНЯТА Критиком (reviewed_at). Если Критик не отозвался за REVIEW_WAIT_MS —
+//     присылаем что есть (предохранитель). Пока идёт доработка (статус не done) —
+//     ждём финал. ---
 async function watchResults() {
   // eslint-disable-next-line no-constant-condition
   while (true) {
     try {
       if (pending.size) {
         const ids = [...pending.keys()];
-        const { data, error } = await db.from('tasks').select('id, status, description').in('id', ids);
+        const { data, error } = await db
+          .from('tasks')
+          .select('id, status, description, reviewed_at')
+          .in('id', ids);
         if (!error) {
           for (const t of data || []) {
-            if (t.status === 'done') {
-              const chatId = pending.get(t.id);
+            const entry = pending.get(t.id);
+            if (!entry) continue;
+
+            if (t.status === 'done' && t.reviewed_at) {
+              // финальная, принятая Критиком версия — отправляем
               pending.delete(t.id);
-              await send(chatId, extractResult(t.description));
-              console.log(`📤 [${ts()}] Результат задачи ${t.id} → чат ${chatId}.`);
+              await send(entry.chatId, extractResult(t.description));
+              console.log(`📤 [${ts()}] Принятый результат задачи ${t.id} → чат ${entry.chatId}.`);
+            } else if (t.status === 'done') {
+              // готово, но Критик ещё не принял — ждём, но не бесконечно
+              if (!entry.doneSince) entry.doneSince = Date.now();
+              if (Date.now() - entry.doneSince >= REVIEW_WAIT_MS) {
+                pending.delete(t.id);
+                await send(entry.chatId, extractResult(t.description));
+                console.log(`📤 [${ts()}] Результат задачи ${t.id} (без ревью, по таймауту) → чат ${entry.chatId}.`);
+              }
+            } else {
+              // снова в работе (например, на доработке) — сбрасываем таймер ожидания
+              entry.doneSince = null;
             }
           }
         }
@@ -142,9 +167,9 @@ async function handleMessage(msg) {
     return;
   }
 
-  pending.set(task.id, chatId);
+  pending.set(task.id, { chatId, doneSince: null });
   console.log(`📥 [${ts()}] Telegram (чат ${chatId}): "${title}" → задача ${task.id}`);
-  await send(chatId, '🧠 Принял! Рой взял задачу в работу…');
+  await send(chatId, '🧠 Принял! Рой работает над задачей, пришлю ответ, когда Критик его примет…');
 }
 
 // --- основной цикл: long-polling getUpdates ---
