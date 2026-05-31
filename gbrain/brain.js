@@ -82,3 +82,63 @@ export async function think(task, agent) {
     return `(сбой связи с LLM) Задача «${task.title}» помечена выполненной без результата.`;
   }
 }
+
+// ------------------------------------------------------------
+// plan(task) — РАЗБИТЬ большую цель на 3–5 конкретных подзадач.
+// Используется Стратегом. Возвращает массив { title, description }.
+// Если мозга нет или разбор не удался — пустой массив (вызывающий решит,
+// что делать: например, оставит цель как обычную задачу).
+// ------------------------------------------------------------
+export async function plan(task) {
+  if (!process.env.GROQ_API_KEY) return [];
+
+  const persona = getPersona('Стратег');
+  const system =
+    persona.system +
+    `\n\nРазбей цель на 3–5 КОНКРЕТНЫХ подзадач для других агентов роя. ` +
+    `Каждая подзадача — самодостаточный шаг с понятным результатом. ` +
+    `Ответь СТРОГО валидным JSON-массивом без какого-либо текста вокруг, в формате: ` +
+    `[{"title":"кратко","description":"что именно сделать"}]. ` +
+    `Только русский язык.`;
+
+  const user =
+    `Цель: ${task.title}\n` +
+    (task.description ? `Подробности: ${task.description}\n` : '') +
+    `\nВерни JSON-массив подзадач.`;
+
+  let raw = '';
+  try {
+    raw = await callLLM(
+      [
+        { role: 'system', content: system },
+        { role: 'user', content: user },
+      ],
+      { temperature: 0.4, maxTokens: 700 }
+    );
+  } catch (e) {
+    console.error('⚠️  Стратег не смог обратиться к мозгу (Groq):', e.message);
+    return [];
+  }
+
+  // вырезаем JSON-массив из ответа (LLM иногда добавляет ```json или пояснения)
+  const start = raw.indexOf('[');
+  const end = raw.lastIndexOf(']');
+  if (start === -1 || end === -1 || end <= start) return [];
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw.slice(start, end + 1));
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+
+  // нормализуем и отбрасываем мусор; не больше 5 подзадач
+  return parsed
+    .map((p) => ({
+      title: String(p?.title ?? '').trim(),
+      description: String(p?.description ?? '').trim(),
+    }))
+    .filter((p) => p.title)
+    .slice(0, 5);
+}

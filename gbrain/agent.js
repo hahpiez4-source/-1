@@ -17,7 +17,7 @@
 
 import 'dotenv/config';
 import { createClient } from '@supabase/supabase-js';
-import { think, hasBrain } from './brain.js';
+import { think, plan, hasBrain } from './brain.js';
 
 const {
   SUPABASE_URL,
@@ -33,6 +33,7 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
 
 const POLL = Number(POLL_MS) || 5000;
 const ARCHIVIST = 'Архивариус'; // агент-хранитель памяти
+const PLANNER = 'Стратег';      // агент-планировщик: разбивает цели на подзадачи
 
 const db = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
   auth: { persistSession: false },
@@ -109,6 +110,64 @@ async function checkMailbox(me) {
   }
 }
 
+// --- СТРАТЕГ: разложить цель на подзадачи и положить их на доску ---
+// Возвращает true, если цель была разложена (tick завершён),
+// false — если разбить не удалось (тогда задачу выполняем как обычную).
+async function decompose(me, task) {
+  console.log(hasBrain() ? '🧭 Планирую: разбиваю цель на подзадачи...' : '⚙️  Нет LLM — план не построить.');
+  const subtasks = await plan(task);
+
+  if (!subtasks.length) {
+    console.log('🤔 Не получилось разложить на подзадачи — выполню как обычную задачу.');
+    return false;
+  }
+
+  // кладём подзадачи на доску: ничьи (assignee_id null) → ядро раздаст их;
+  // priority чуть выше родителя, чтобы делались раньше следующих целей.
+  const childPriority = Math.max(1, (task.priority ?? 3) - 1);
+  // вшиваем исходную цель в описание каждой подзадачи: исполнитель берёт её
+  // в отрыве от родителя и иначе теряет тему (LLM начинает фантазировать).
+  const goalContext = `(в рамках цели: «${task.title}»)`;
+  const rows = subtasks.map((s) => ({
+    title: s.title,
+    description: `${goalContext}\n${s.description || ''}`.trim(),
+    status: 'todo',
+    priority: childPriority,
+    parent_task_id: task.id,
+    created_by: me.id,
+  }));
+
+  const { error: insErr } = await db.from('tasks').insert(rows);
+  if (insErr) {
+    console.error('⚠️  Не смог создать подзадачи:', insErr.message);
+    return false;
+  }
+
+  const planText = subtasks.map((s, i) => `${i + 1}. ${s.title}${s.description ? ` — ${s.description}` : ''}`).join('\n');
+  console.log(`🗂️  Создал ${subtasks.length} подзадач(и):\n${planText}\n`);
+
+  // саму цель помечаем выполненной (план построен) и сохраняем план в описание
+  const stamped =
+    (task.description ? task.description + '\n\n' : '') +
+    `--- План (${me.name}, ${ts()}) ---\n${planText}`;
+  await db.from('tasks').update({ status: 'done', description: stamped }).eq('id', task.id);
+
+  // отчитываемся Архивариусу — пусть план попадёт в память
+  const archivist = await findAgentByName(ARCHIVIST);
+  if (archivist) {
+    await db.from('messages').insert({
+      from_id: me.id,
+      to_id: archivist.id,
+      task_id: task.id,
+      body: `Разложил цель «${task.title}» на ${subtasks.length} подзадач:\n${planText}`,
+    });
+    console.log(`✉️  Отправил план лично «${ARCHIVIST}» — в память.`);
+  }
+
+  await db.from('agents').update({ status: 'idle', last_seen: now() }).eq('id', me.id);
+  return true;
+}
+
 // Один круг дежурства. Возвращает true, если была активность (можно сразу повторить).
 async function tick(me) {
   await db.from('agents').update({ last_seen: now() }).eq('id', me.id);
@@ -164,7 +223,7 @@ async function tick(me) {
     .update({ status: 'in_progress', assignee_id: me.id })
     .eq('id', candidate.id)
     .eq('status', 'todo') // ← «замок»: второй агент сюда уже не пройдёт
-    .select('id, title');
+    .select('id, title, description, parent_task_id, priority');
 
   if (claimErr) {
     console.error('⚠️  Ошибка при бронировании задачи:', claimErr.message);
@@ -178,6 +237,15 @@ async function tick(me) {
   console.log(`\n📋 [${ts()}] Беру задачу: "${task.title}"`);
 
   await db.from('agents').update({ status: 'working', last_seen: now() }).eq('id', me.id);
+
+  // 🧭 СТРАТЕГ: если это КОРНЕВАЯ цель (без родителя) — раскладываем её на подзадачи.
+  //    Подзадачи (у которых parent_task_id уже задан) Стратег выполняет как обычные —
+  //    это защита от бесконечного дробления.
+  if (me.name === PLANNER && !task.parent_task_id) {
+    const handled = await decompose(me, task);
+    if (handled) return true;
+    // если разложить не удалось — падаем ниже в обычный режим
+  }
 
   // 🧠 ДУМАЕМ над задачей через LLM (если есть мозг — реальный результат; иначе заглушка)
   console.log(hasBrain() ? '🧠 Думаю над задачей (LLM)...' : '⚙️  Обрабатываю (без LLM)...');
