@@ -56,7 +56,7 @@ async function tick(me) {
   // отмечаемся живыми
   await db.from('agents').update({ last_seen: now() }).eq('id', me.id);
 
-  // берём самую приоритетную todo-задачу
+  // 1) подсматриваем самую приоритетную todo-задачу
   const { data: tasks, error } = await db
     .from('tasks')
     .select('id, title')
@@ -76,11 +76,32 @@ async function tick(me) {
     return false;
   }
 
-  const task = tasks[0];
+  const candidate = tasks[0];
+
+  // 2) АТОМАРНОЕ бронирование: помечаем задачу за собой ТОЛЬКО если она всё ещё 'todo'.
+  //    Если другой агент успел раньше — условие .eq('status','todo') не сработает,
+  //    вернётся пусто, и мы просто попробуем следующий круг. Так двое не возьмут одно.
+  const { data: claimed, error: claimErr } = await db
+    .from('tasks')
+    .update({ status: 'in_progress', assignee_id: me.id })
+    .eq('id', candidate.id)
+    .eq('status', 'todo') // ← вот это и есть «замок»
+    .select('id, title');
+
+  if (claimErr) {
+    console.error('⚠️  Ошибка при бронировании задачи:', claimErr.message);
+    return false;
+  }
+
+  if (!claimed || claimed.length === 0) {
+    // не успели — задачу перехватил другой агент. Без паники, идём на новый круг.
+    return true; // вернём true, чтобы сразу проверить, нет ли других задач
+  }
+
+  const task = claimed[0];
   console.log(`\n📋 [${new Date().toLocaleTimeString()}] Беру задачу: "${task.title}"`);
 
   await db.from('agents').update({ status: 'working', last_seen: now() }).eq('id', me.id);
-  await db.from('tasks').update({ status: 'in_progress', assignee_id: me.id }).eq('id', task.id);
   console.log('⚙️  В работе...');
 
   await sleep(1500); // имитация полезной работы
