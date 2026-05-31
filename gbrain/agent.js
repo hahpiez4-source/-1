@@ -17,6 +17,7 @@
 
 import 'dotenv/config';
 import { createClient } from '@supabase/supabase-js';
+import { think, hasBrain } from './brain.js';
 
 const {
   SUPABASE_URL,
@@ -156,31 +157,37 @@ async function tick(me) {
   console.log(`\n📋 [${ts()}] Беру задачу: "${task.title}"`);
 
   await db.from('agents').update({ status: 'working', last_seen: now() }).eq('id', me.id);
-  console.log('⚙️  В работе...');
 
-  await sleep(1500); // имитация полезной работы
+  // 🧠 ДУМАЕМ над задачей через LLM (если есть мозг — реальный результат; иначе заглушка)
+  console.log(hasBrain() ? '🧠 Думаю над задачей (LLM)...' : '⚙️  Обрабатываю (без LLM)...');
+  const result = await think(task, me);
+  console.log(`📝 Результат:\n${result}\n`);
 
-  await db.from('tasks').update({ status: 'done' }).eq('id', task.id);
+  // сохраняем результат прямо в задачу (в описание дописываем итог)
+  const stamped =
+    (task.description ? task.description + '\n\n' : '') +
+    `--- Результат (${me.name}, ${ts()}) ---\n${result}`;
+  await db.from('tasks').update({ status: 'done', description: stamped }).eq('id', task.id);
   console.log('✅ Готово.');
 
-  // 3) отчитываемся. Если есть Архивариус (и это не я сам) — пишем ЛИЧНО ему.
+  // 3) отчитываемся. Если есть Архивариус (и это не я сам) — пересылаем ему РЕЗУЛЬТАТ в память.
   const archivist = me.name === ARCHIVIST ? null : await findAgentByName(ARCHIVIST);
   if (archivist) {
     await db.from('messages').insert({
       from_id: me.id,
       to_id: archivist.id, // личное письмо конкретному агенту
       task_id: task.id,
-      body: `Выполнил задачу «${task.title}». Прошу записать в память.`,
+      body: `Выполнил задачу «${task.title}». Результат:\n${result}`,
     });
-    console.log(`✉️  Написал лично «${ARCHIVIST}»: прошу записать в память.`);
+    console.log(`✉️  Отправил результат лично «${ARCHIVIST}» — в память.`);
   } else {
     await db.from('messages').insert({
       from_id: me.id,
       to_id: null, // всем в рой
       task_id: task.id,
-      body: `Задачу «${task.title}» выполнил ✅`,
+      body: `Задачу «${task.title}» выполнил ✅\nРезультат:\n${result}`,
     });
-    console.log('💬 Написал в общий мессенджер роя.');
+    console.log('💬 Написал результат в общий мессенджер роя.');
   }
 
   await db.from('agents').update({ status: 'idle', last_seen: now() }).eq('id', me.id);
