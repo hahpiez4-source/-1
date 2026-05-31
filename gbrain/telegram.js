@@ -40,13 +40,8 @@ const db = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSes
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const ts = () => new Date().toLocaleTimeString();
 
-// task_id -> { chatId, doneSince }: какие задачи ждём и куда вернуть результат.
-// doneSince — момент, когда задача впервые стала done (для предохранителя ниже).
+// task_id -> { chatId }: какие задачи ждём и куда вернуть результат.
 const pending = new Map();
-
-// Сколько ждать принятия Критиком, прежде чем прислать ответ всё равно
-// (предохранитель на случай, если Критик не запущен).
-const REVIEW_WAIT_MS = 30000;
 
 // --- вызов Telegram API ---
 async function tg(method, payload) {
@@ -84,10 +79,9 @@ function extractResult(desc) {
   return rest.trim() || 'Готово ✅';
 }
 
-// --- следим за выполнением: шлём результат в чат, когда задача ГОТОВА и
-//     ПРИНЯТА Критиком (reviewed_at). Если Критик не отозвался за REVIEW_WAIT_MS —
-//     присылаем что есть (предохранитель). Пока идёт доработка (статус не done) —
-//     ждём финал. ---
+// --- следим за выполнением: шлём результат в чат СРАЗУ, как только задача
+//     стала ГОТОВА (status === 'done'). Шаг ревью Критиком в чате отключён —
+//     ответ не ждёт принятия. ---
 async function watchResults() {
   // eslint-disable-next-line no-constant-condition
   while (true) {
@@ -103,22 +97,11 @@ async function watchResults() {
             const entry = pending.get(t.id);
             if (!entry) continue;
 
-            if (t.status === 'done' && t.reviewed_at) {
-              // финальная, принятая Критиком версия — отправляем
+            if (t.status === 'done') {
+              // ревью отключено: отправляем сразу, как только задача готова
               pending.delete(t.id);
               await send(entry.chatId, extractResult(t.description));
-              console.log(`📤 [${ts()}] Принятый результат задачи ${t.id} → чат ${entry.chatId}.`);
-            } else if (t.status === 'done') {
-              // готово, но Критик ещё не принял — ждём, но не бесконечно
-              if (!entry.doneSince) entry.doneSince = Date.now();
-              if (Date.now() - entry.doneSince >= REVIEW_WAIT_MS) {
-                pending.delete(t.id);
-                await send(entry.chatId, extractResult(t.description));
-                console.log(`📤 [${ts()}] Результат задачи ${t.id} (без ревью, по таймауту) → чат ${entry.chatId}.`);
-              }
-            } else {
-              // снова в работе (например, на доработке) — сбрасываем таймер ожидания
-              entry.doneSince = null;
+              console.log(`📤 [${ts()}] Результат задачи ${t.id} → чат ${entry.chatId}.`);
             }
           }
         }
@@ -167,9 +150,9 @@ async function handleMessage(msg) {
     return;
   }
 
-  pending.set(task.id, { chatId, doneSince: null });
+  pending.set(task.id, { chatId });
   console.log(`📥 [${ts()}] Telegram (чат ${chatId}): "${title}" → задача ${task.id}`);
-  await send(chatId, '🧠 Принял! Рой работает над задачей, пришлю ответ, когда Критик его примет…');
+  await send(chatId, '🧠 Принял! Рой работает над задачей, пришлю ответ, как только будет готово…');
 }
 
 // --- основной цикл: long-polling getUpdates ---
