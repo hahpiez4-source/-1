@@ -6,7 +6,8 @@
   "description": "gbrain — рой ИИ-агентов с общим мозгом (worker-агент)",
   "scripts": {
     "agent": "node agent.js",
-    "gbrain": "node gbrain.js"
+    "gbrain": "node gbrain.js",
+    "telegram": "node telegram.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
