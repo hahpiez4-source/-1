@@ -17,7 +17,7 @@
 
 import 'dotenv/config';
 import { createClient } from '@supabase/supabase-js';
-import { think, plan, hasBrain } from './brain.js';
+import { think, plan, research, hasBrain, hasWebSearch } from './brain.js';
 
 const {
   SUPABASE_URL,
@@ -32,8 +32,9 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
 }
 
 const POLL = Number(POLL_MS) || 5000;
-const ARCHIVIST = 'Архивариус'; // агент-хранитель памяти
-const PLANNER = 'Стратег';      // агент-планировщик: разбивает цели на подзадачи
+const ARCHIVIST = 'Архивариус';   // агент-хранитель памяти
+const PLANNER = 'Стратег';        // агент-планировщик: разбивает цели на подзадачи
+const RESEARCHER = 'Исследователь'; // агент с настоящим веб-поиском
 
 const db = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
   auth: { persistSession: false },
@@ -247,9 +248,16 @@ async function tick(me) {
     // если разложить не удалось — падаем ниже в обычный режим
   }
 
-  // 🧠 ДУМАЕМ над задачей через LLM (если есть мозг — реальный результат; иначе заглушка)
-  console.log(hasBrain() ? '🧠 Думаю над задачей (LLM)...' : '⚙️  Обрабатываю (без LLM)...');
-  const result = await think(task, me);
+  // 🧠 РАБОТАЕМ над задачей. Исследователь ищет в интернете (веб-поиск),
+  //    остальные «думают» через обычную LLM (или заглушка, если ключа нет).
+  let result;
+  if (me.name === RESEARCHER) {
+    console.log(hasWebSearch() ? '🔎 Ищу информацию в интернете (Tavily)...' : '🧠 Думаю над задачей (без веб-поиска)...');
+    result = await research(task);
+  } else {
+    console.log(hasBrain() ? '🧠 Думаю над задачей (LLM)...' : '⚙️  Обрабатываю (без LLM)...');
+    result = await think(task, me);
+  }
   console.log(`📝 Результат:\n${result}\n`);
 
   // сохраняем результат прямо в задачу (в описание дописываем итог)

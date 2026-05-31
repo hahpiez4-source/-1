@@ -16,26 +16,34 @@ import { getPersona } from './personas.js';
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
 
-// Есть ли вообще мозг (ключ)?
+// Веб-поиск для Исследователя — через Tavily (поисковый API для ИИ-агентов).
+// Возвращает короткие выжимки + ссылки, поэтому надёжно укладывается в лимиты.
+const TAVILY_URL = 'https://api.tavily.com/search';
+
+// Есть ли вообще мозг (ключ Groq)?
 export function hasBrain() {
   return Boolean(process.env.GROQ_API_KEY);
 }
 
+// Есть ли веб-поиск (ключ Tavily)?
+export function hasWebSearch() {
+  return Boolean(process.env.TAVILY_API_KEY);
+}
+
 // Низкоуровневый вызов LLM. messages = [{role, content}, ...].
 // Возвращает строку-ответ или бросает ошибку (вызывающий решает, что делать).
-export async function callLLM(messages, { temperature = 0.7, maxTokens = 600 } = {}) {
+export async function callLLM(messages, { temperature = 0.7, maxTokens = 600, model = MODEL, raw = false } = {}) {
+  const body = { model, messages, temperature };
+  // max_tokens шлём, только если задан (даём возможность не ограничивать ответ).
+  if (maxTokens) body.max_tokens = maxTokens;
+
   const resp = await fetch(GROQ_URL, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
     },
-    body: JSON.stringify({
-      model: MODEL,
-      messages,
-      temperature,
-      max_tokens: maxTokens,
-    }),
+    body: JSON.stringify(body),
   });
 
   if (!resp.ok) {
@@ -44,6 +52,8 @@ export async function callLLM(messages, { temperature = 0.7, maxTokens = 600 } =
   }
 
   const data = await resp.json();
+  // raw=true — вернуть весь ответ (нужно, чтобы прочитать executed_tools у compound).
+  if (raw) return data;
   return data?.choices?.[0]?.message?.content?.trim() || '';
 }
 
@@ -141,4 +151,99 @@ export async function plan(task) {
     }))
     .filter((p) => p.title)
     .slice(0, 5);
+}
+
+// Низкоуровневый веб-поиск через Tavily. Возвращает { answer, results[] }.
+// results[i] = { title, url, content }. Бросает ошибку при сбое.
+async function tavilySearch(query) {
+  const resp = await fetch(TAVILY_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${process.env.TAVILY_API_KEY}`,
+    },
+    body: JSON.stringify({
+      query,
+      search_depth: 'basic', // basic = 1 кредит (экономим бесплатные 1000/мес)
+      max_results: 5,
+      include_answer: 'advanced', // Tavily вернёт и краткий синтез-ответ
+      topic: 'general',
+    }),
+  });
+
+  if (!resp.ok) {
+    const errText = await resp.text();
+    throw new Error(`Tavily ${resp.status}: ${errText.slice(0, 200)}`);
+  }
+  return resp.json();
+}
+
+// ------------------------------------------------------------
+// research(task) — настоящий ВЕБ-ПОИСК (для Исследователя).
+// 1) ищет в интернете через Tavily (короткие выжимки + ссылки);
+// 2) суммирует найденное нашей LLM в характере Исследователя, со ссылками.
+// Аккуратные откаты: нет ключа Tavily → обычное think(); нет Groq → отдаём
+// сырые результаты Tavily; сбой суммаризации → тоже сырые результаты.
+// ------------------------------------------------------------
+export async function research(task) {
+  // нет ключа Tavily — честно работаем без веба
+  if (!hasWebSearch()) {
+    console.log('ℹ️  Нет TAVILY_API_KEY — Исследователь отвечает без веб-поиска.');
+    return think(task, { name: 'Исследователь' });
+  }
+
+  const query = task.description ? `${task.title}. ${task.description}` : task.title;
+
+  let sr;
+  try {
+    sr = await tavilySearch(query);
+  } catch (e) {
+    console.error('⚠️  Веб-поиск (Tavily) не удался, отвечаю в обычном режиме:', e.message);
+    return think(task, { name: 'Исследователь' });
+  }
+
+  const results = Array.isArray(sr?.results) ? sr.results : [];
+  console.log(`🔎 Tavily нашёл источников: ${results.length}.`);
+
+  const sourcesList = results.map((r, i) => `${i + 1}. ${r.title} — ${r.url}`).join('\n');
+
+  // нет нашей LLM для красивой сводки — отдаём ответ Tavily + ссылки как есть
+  if (!hasBrain()) {
+    return `${sr.answer || 'Найдены источники по запросу.'}\n\nИсточники:\n${sourcesList}`.trim();
+  }
+
+  // материалы для модели: короткие выжимки из найденных страниц
+  const snippets = results
+    .map((r, i) => `[${i + 1}] ${r.title}\n${r.url}\n${(r.content || '').slice(0, 500)}`)
+    .join('\n\n');
+
+  const persona = getPersona('Исследователь');
+  const system =
+    persona.system +
+    '\n\nТебе дали свежие материалы из интернета (выжимки и ссылки). ' +
+    'На их основе дай сжатую полезную сводку на русском: ключевые факты, варианты, на что обратить внимание. ' +
+    'Опирайся ТОЛЬКО на эти материалы, ничего не выдумывай. ' +
+    'В конце ОБЯЗАТЕЛЬНО добавь раздел «Источники:» со списком ссылок.';
+
+  const userMsg =
+    `Задача: ${task.title}\n` +
+    (task.description ? `Описание: ${task.description}\n` : '') +
+    `\nМатериалы из интернета:\n${snippets}\n\n` +
+    (sr.answer ? `Краткий ответ поисковика: ${sr.answer}\n\n` : '') +
+    `Сделай сводку.`;
+
+  try {
+    const text = await callLLM(
+      [
+        { role: 'system', content: system },
+        { role: 'user', content: userMsg },
+      ],
+      { temperature: 0.3, maxTokens: 800 }
+    );
+    // подстрахуемся: если модель забыла ссылки — добавим их сами
+    return text && text.includes('http') ? text : `${text || ''}\n\nИсточники:\n${sourcesList}`.trim();
+  } catch (e) {
+    console.error('⚠️  Не смог суммировать (Groq), отдаю сырые результаты:', e.message);
+    return `${sr.answer || ''}\n\nИсточники:\n${sourcesList}`.trim();
+  }
 }
