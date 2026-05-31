@@ -1,14 +1,17 @@
 // ============================================================
-// gbrain — worker-агент (Этап «оживить», режим ДЕЖУРСТВА).
+// gbrain — worker-агент (режим ДЕЖУРСТВА + переписка агентов).
 //
-// Агент запускается ОДИН раз и работает бесконечно:
-//   - каждые POLL_MS секунд заглядывает на доску задач
-//   - есть задача "todo"  → берёт, делает (in_progress → done),
-//                            пишет в общий мессенджер
-//   - задач нет           → тихо ждёт следующего круга
-//   - каждый круг «отмечается живым» (last_seen = сейчас)
+// Каждый круг дежурства агент:
+//   0) проверяет свой ПОЧТОВЫЙ ЯЩИК — есть ли письма лично ему,
+//      и реагирует на них (Архивариус — сохраняет в общую память);
+//   1) заглядывает на доску задач;
+//   2) есть "todo" → атомарно бронирует, делает (in_progress → done);
+//   3) по итогу пишет ЛИЧНО Архивариусу: «запиши результат в память»
+//      (если Архивариуса нет — пишет всем в общий мессенджер);
+//   4) каждый круг «отмечается живым» (last_seen = сейчас).
 //
-// Запуск:   npm run agent
+// Запуск:   npm run agent           (по умолчанию AGENT_NAME=Takopi)
+//           AGENT_NAME=Архивариус npm run agent
 // Остановка: Ctrl+C
 // ============================================================
 
@@ -19,7 +22,7 @@ const {
   SUPABASE_URL,
   SUPABASE_SERVICE_KEY,
   AGENT_NAME = 'Takopi',
-  POLL_MS = '5000', // как часто проверять доску (мс)
+  POLL_MS = '5000', // как часто проверять доску и почту (мс)
 } = process.env;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
@@ -28,6 +31,7 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
 }
 
 const POLL = Number(POLL_MS) || 5000;
+const ARCHIVIST = 'Архивариус'; // агент-хранитель памяти
 
 const db = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
   auth: { persistSession: false },
@@ -35,6 +39,7 @@ const db = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const now = () => new Date().toISOString();
+const ts = () => new Date().toLocaleTimeString();
 
 // Находим себя в таблице agents (один раз при старте).
 async function findSelf() {
@@ -50,11 +55,65 @@ async function findSelf() {
   return me;
 }
 
-// Один круг дежурства: проверить доску и при наличии — выполнить одну задачу.
-// Возвращает true, если задача была выполнена (значит можно сразу проверить ещё).
+// Найти агента по имени (возвращает {id, name} или null).
+async function findAgentByName(name) {
+  const { data } = await db.from('agents').select('id, name').eq('name', name).maybeSingle();
+  return data ?? null;
+}
+
+// --- ПОЧТОВЫЙ ЯЩИК: читаем письма лично нам (to_id = me.id, ещё не прочитанные) ---
+async function checkMailbox(me) {
+  const { data: inbox, error } = await db
+    .from('messages')
+    .select('id, from_id, body, task_id')
+    .eq('to_id', me.id)
+    .is('read_at', null)
+    .order('created_at', { ascending: true });
+
+  if (error) {
+    console.error('⚠️  Не смог проверить почту:', error.message);
+    return;
+  }
+  if (!inbox || inbox.length === 0) return;
+
+  for (const letter of inbox) {
+    // от кого письмо
+    const { data: sender } = await db.from('agents').select('name').eq('id', letter.from_id).maybeSingle();
+    const fromName = sender?.name ?? 'неизвестный';
+    console.log(`📨 [${ts()}] Письмо от «${fromName}»: ${letter.body}`);
+
+    // помечаем прочитанным
+    await db.from('messages').update({ read_at: now() }).eq('id', letter.id);
+
+    // РЕАКЦИЯ: если я Архивариус — сохраняю содержимое в общую память и отвечаю отправителю.
+    if (me.name === ARCHIVIST) {
+      await db.from('memory').insert({
+        agent_id: me.id,
+        kind: 'note',
+        title: `Из письма от «${fromName}»`,
+        content: letter.body,
+        tags: ['inbox', fromName],
+      });
+      console.log(`🗄️  Записал в общую память.`);
+
+      // ответ отправителю (личное письмо обратно)
+      await db.from('messages').insert({
+        from_id: me.id,
+        to_id: letter.from_id,
+        task_id: letter.task_id ?? null,
+        body: `Принял, записал в память ✅`,
+      });
+      console.log(`✉️  Ответил «${fromName}».`);
+    }
+  }
+}
+
+// Один круг дежурства. Возвращает true, если была активность (можно сразу повторить).
 async function tick(me) {
-  // отмечаемся живыми
   await db.from('agents').update({ last_seen: now() }).eq('id', me.id);
+
+  // 0) сначала разбираем почту
+  await checkMailbox(me);
 
   // 1) подсматриваем самую приоритетную todo-задачу
   const { data: tasks, error } = await db
@@ -71,35 +130,30 @@ async function tick(me) {
   }
 
   if (!tasks || tasks.length === 0) {
-    // задач нет — тихо ждём (статус idle)
     await db.from('agents').update({ status: 'idle' }).eq('id', me.id);
     return false;
   }
 
   const candidate = tasks[0];
 
-  // 2) АТОМАРНОЕ бронирование: помечаем задачу за собой ТОЛЬКО если она всё ещё 'todo'.
-  //    Если другой агент успел раньше — условие .eq('status','todo') не сработает,
-  //    вернётся пусто, и мы просто попробуем следующий круг. Так двое не возьмут одно.
+  // 2) АТОМАРНОЕ бронирование: берём задачу ТОЛЬКО если она всё ещё 'todo'.
   const { data: claimed, error: claimErr } = await db
     .from('tasks')
     .update({ status: 'in_progress', assignee_id: me.id })
     .eq('id', candidate.id)
-    .eq('status', 'todo') // ← вот это и есть «замок»
+    .eq('status', 'todo') // ← «замок»: второй агент сюда уже не пройдёт
     .select('id, title');
 
   if (claimErr) {
     console.error('⚠️  Ошибка при бронировании задачи:', claimErr.message);
     return false;
   }
-
   if (!claimed || claimed.length === 0) {
-    // не успели — задачу перехватил другой агент. Без паники, идём на новый круг.
-    return true; // вернём true, чтобы сразу проверить, нет ли других задач
+    return true; // перехватил другой агент — идём на новый круг
   }
 
   const task = claimed[0];
-  console.log(`\n📋 [${new Date().toLocaleTimeString()}] Беру задачу: "${task.title}"`);
+  console.log(`\n📋 [${ts()}] Беру задачу: "${task.title}"`);
 
   await db.from('agents').update({ status: 'working', last_seen: now() }).eq('id', me.id);
   console.log('⚙️  В работе...');
@@ -107,13 +161,27 @@ async function tick(me) {
   await sleep(1500); // имитация полезной работы
 
   await db.from('tasks').update({ status: 'done' }).eq('id', task.id);
-  await db.from('messages').insert({
-    from_id: me.id,
-    to_id: null, // всем в рой
-    task_id: task.id,
-    body: `Задачу «${task.title}» выполнил ✅`,
-  });
-  console.log('✅ Готово, написал в мессенджер роя.');
+  console.log('✅ Готово.');
+
+  // 3) отчитываемся. Если есть Архивариус (и это не я сам) — пишем ЛИЧНО ему.
+  const archivist = me.name === ARCHIVIST ? null : await findAgentByName(ARCHIVIST);
+  if (archivist) {
+    await db.from('messages').insert({
+      from_id: me.id,
+      to_id: archivist.id, // личное письмо конкретному агенту
+      task_id: task.id,
+      body: `Выполнил задачу «${task.title}». Прошу записать в память.`,
+    });
+    console.log(`✉️  Написал лично «${ARCHIVIST}»: прошу записать в память.`);
+  } else {
+    await db.from('messages').insert({
+      from_id: me.id,
+      to_id: null, // всем в рой
+      task_id: task.id,
+      body: `Задачу «${task.title}» выполнил ✅`,
+    });
+    console.log('💬 Написал в общий мессенджер роя.');
+  }
 
   await db.from('agents').update({ status: 'idle', last_seen: now() }).eq('id', me.id);
   return true;
@@ -122,24 +190,22 @@ async function tick(me) {
 async function main() {
   const me = await findSelf();
   console.log(`\n🤖 Агент "${me.name}" (${me.color}) заступил на дежурство.`);
-  console.log(`👀 Проверяю доску каждые ${POLL / 1000} сек. Останов — Ctrl+C.\n`);
+  console.log(`👀 Проверяю доску и почту каждые ${POLL / 1000} сек. Останов — Ctrl+C.\n`);
 
-  let idleNote = false; // чтобы не спамить "задач нет" каждый круг
+  let idleNote = false;
 
-  // бесконечный цикл дежурства
   // eslint-disable-next-line no-constant-condition
   while (true) {
     try {
       const did = await tick(me);
       if (did) {
         idleNote = false;
-        // выполнили — сразу проверим, нет ли ещё (короткая пауза)
         await sleep(300);
         continue;
       }
       if (!idleNote) {
-        console.log(`📭 [${new Date().toLocaleTimeString()}] Задач нет, жду новые...`);
-        idleNote = true; // покажем сообщение один раз, пока доска пустая
+        console.log(`📭 [${ts()}] Задач и писем нет, жду...`);
+        idleNote = true;
       }
     } catch (e) {
       console.error('💥 Ошибка в круге:', e.message);
