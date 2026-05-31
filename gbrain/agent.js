@@ -17,7 +17,7 @@
 
 import 'dotenv/config';
 import { createClient } from '@supabase/supabase-js';
-import { think, plan, research, hasBrain, hasWebSearch } from './brain.js';
+import { think, plan, research, review, hasBrain, hasWebSearch } from './brain.js';
 
 const {
   SUPABASE_URL,
@@ -35,6 +35,7 @@ const POLL = Number(POLL_MS) || 5000;
 const ARCHIVIST = 'Архивариус';   // агент-хранитель памяти
 const PLANNER = 'Стратег';        // агент-планировщик: разбивает цели на подзадачи
 const RESEARCHER = 'Исследователь'; // агент с настоящим веб-поиском
+const CRITIC = 'Критик';          // агент-ревьюер: рецензирует чужие результаты
 
 const db = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
   auth: { persistSession: false },
@@ -169,12 +170,84 @@ async function decompose(me, task) {
   return true;
 }
 
+// --- КРИТИК: найти одну выполненную, но ещё не отрецензированную задачу
+// (сделанную НЕ нами) и написать рецензию. Возвращает true, если рецензировал.
+async function reviewDoneTasks(me) {
+  const { data: rows, error } = await db
+    .from('tasks')
+    .select('id, title, description, assignee_id')
+    .eq('status', 'done')
+    .is('reviewed_at', null)
+    .not('assignee_id', 'is', null) // только реально кем-то сделанные
+    .neq('assignee_id', me.id) // не рецензируем сами себя
+    .order('updated_at', { ascending: true })
+    .limit(1);
+
+  if (error) {
+    console.error('⚠️  Не смог прочитать доску для ревью:', error.message);
+    return false;
+  }
+  const task = rows?.[0];
+  if (!task) return false;
+
+  // АТОМАРНО «застолбим» рецензию: ставим reviewed_at только если он ещё пуст,
+  // чтобы два Критика не отрецензировали одну задачу дважды.
+  const { data: claimed, error: claimErr } = await db
+    .from('tasks')
+    .update({ reviewed_at: now() })
+    .eq('id', task.id)
+    .is('reviewed_at', null)
+    .select('id');
+
+  if (claimErr) {
+    console.error('⚠️  Ошибка при бронировании рецензии:', claimErr.message);
+    return false;
+  }
+  if (!claimed || claimed.length === 0) return true; // успел другой — на новый круг
+
+  console.log(`\n🔍 [${ts()}] Рецензирую результат задачи: "${task.title}"`);
+  await db.from('agents').update({ status: 'working', last_seen: now() }).eq('id', me.id);
+
+  const verdict = hasBrain() ? '🧠 Разбираю результат (LLM)...' : '⚙️  Просматриваю (без LLM)...';
+  console.log(verdict);
+  const text = await review(task);
+  console.log(`📝 Рецензия:\n${text}\n`);
+
+  // письмо автору результата
+  await db.from('messages').insert({
+    from_id: me.id,
+    to_id: task.assignee_id,
+    task_id: task.id,
+    body: `Рецензия на «${task.title}»:\n${text}`,
+  });
+  // сохраняем рецензию в общую память роя
+  await db.from('memory').insert({
+    agent_id: me.id,
+    kind: 'note',
+    title: `Рецензия: ${task.title}`,
+    content: text,
+    tags: ['review'],
+  });
+  console.log('✉️  Отправил рецензию автору и сохранил в память.');
+
+  await db.from('agents').update({ status: 'idle', last_seen: now() }).eq('id', me.id);
+  return true;
+}
+
 // Один круг дежурства. Возвращает true, если была активность (можно сразу повторить).
 async function tick(me) {
   await db.from('agents').update({ last_seen: now() }).eq('id', me.id);
 
   // 0) сначала разбираем почту
   await checkMailbox(me);
+
+  // 0.5) КРИТИК: его главная работа — рецензировать чужие готовые результаты.
+  //      Если есть что рецензировать — делаем это и идём на новый круг.
+  if (me.name === CRITIC) {
+    const reviewed = await reviewDoneTasks(me);
+    if (reviewed) return true;
+    // нечего рецензировать — Критик ниже может взять обычную задачу (если назначат)
+  }
 
   // 1) Ищем задачу. Приоритет: СВОИ назначенные ядром gbrain (assignee_id = я).
   //    Если таких нет — берём ничью (assignee_id is null), чтобы рой работал
