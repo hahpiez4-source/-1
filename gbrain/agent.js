@@ -116,26 +116,47 @@ async function tick(me) {
   // 0) сначала разбираем почту
   await checkMailbox(me);
 
-  // 1) подсматриваем самую приоритетную todo-задачу
-  const { data: tasks, error } = await db
+  // 1) Ищем задачу. Приоритет: СВОИ назначенные ядром gbrain (assignee_id = я).
+  //    Если таких нет — берём ничью (assignee_id is null), чтобы рой работал
+  //    и без ядра. Так агент уважает решения диспетчера, но не простаивает.
+  let candidate = null;
+
+  const mine = await db
     .from('tasks')
     .select('id, title')
     .eq('status', 'todo')
+    .eq('assignee_id', me.id)
     .order('priority', { ascending: true })
     .order('created_at', { ascending: true })
     .limit(1);
 
-  if (error) {
-    console.error('⚠️  Не смог прочитать доску:', error.message);
+  if (mine.error) {
+    console.error('⚠️  Не смог прочитать доску:', mine.error.message);
     return false;
   }
+  candidate = mine.data?.[0] ?? null;
 
-  if (!tasks || tasks.length === 0) {
+  if (!candidate) {
+    const free = await db
+      .from('tasks')
+      .select('id, title')
+      .eq('status', 'todo')
+      .is('assignee_id', null)
+      .order('priority', { ascending: true })
+      .order('created_at', { ascending: true })
+      .limit(1);
+    if (free.error) {
+      console.error('⚠️  Не смог прочитать доску:', free.error.message);
+      return false;
+    }
+    candidate = free.data?.[0] ?? null;
+  }
+
+  if (!candidate) {
+    // ни своих, ни ничьих задач — тихо ждём
     await db.from('agents').update({ status: 'idle' }).eq('id', me.id);
     return false;
   }
-
-  const candidate = tasks[0];
 
   // 2) АТОМАРНОЕ бронирование: берём задачу ТОЛЬКО если она всё ещё 'todo'.
   const { data: claimed, error: claimErr } = await db
