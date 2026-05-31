@@ -248,14 +248,29 @@ export async function research(task) {
   }
 }
 
+// Распознать вердикт из текста рецензии: 'rework' (доработать) или 'accept' (принять).
+// Ориентируемся на финальную строку «ВЕРДИКТ: ...»; при неоднозначности — 'accept'
+// (безопаснее: не гоняем задачу по кругу зря).
+function parseVerdict(text) {
+  const matches = [...String(text).matchAll(/вердикт\s*[:\-]?\s*«?\s*(принять|доработать)/gi)];
+  if (matches.length) {
+    return matches[matches.length - 1][1].toLowerCase() === 'доработать' ? 'rework' : 'accept';
+  }
+  return /доработать/i.test(text) ? 'rework' : 'accept';
+}
+
 // ------------------------------------------------------------
 // review(task) — РЕЦЕНЗИЯ на результат задачи (для Критика).
 // task.description здесь содержит результат работы другого агента.
-// Возвращает строку-отзыв. Без ключа/при сбое — аккуратная заглушка.
+// Возвращает { text, verdict }, где verdict = 'accept' | 'rework'.
+// Без ключа/при сбое — аккуратная заглушка (verdict='accept', чтобы не зациклить).
 // ------------------------------------------------------------
 export async function review(task) {
   if (!process.env.GROQ_API_KEY) {
-    return `(без LLM) Результат задачи «${task.title}» просмотрен. Подключи GROQ_API_KEY для настоящей рецензии.`;
+    return {
+      text: `(без LLM) Результат задачи «${task.title}» просмотрен. Подключи GROQ_API_KEY для настоящей рецензии.`,
+      verdict: 'accept',
+    };
   }
 
   const persona = getPersona('Критик');
@@ -267,21 +282,22 @@ export async function review(task) {
   const userPrompt =
     `Задача: ${task.title}\n` +
     `Результат работы:\n${task.description || '(результат пустой)'}\n\n` +
-    `Дай рецензию по пунктам: 1) что хорошо; 2) что слабо/неточно; ` +
-    `3) что конкретно улучшить; 4) вердикт — «принять» или «доработать».`;
+    `Дай рецензию по пунктам: 1) что хорошо; 2) что слабо/неточно; 3) что конкретно улучшить. ` +
+    `В САМОМ КОНЦЕ отдельной строкой напиши ровно один из вариантов: ` +
+    `«ВЕРДИКТ: ПРИНЯТЬ» или «ВЕРДИКТ: ДОРАБОТАТЬ».`;
 
   try {
-    return (
+    const text =
       (await callLLM(
         [
           { role: 'system', content: system },
           { role: 'user', content: userPrompt },
         ],
         { temperature: 0.4, maxTokens: 500 }
-      )) || `(пустая рецензия) по задаче «${task.title}».`
-    );
+      )) || `(пустая рецензия) по задаче «${task.title}».`;
+    return { text, verdict: parseVerdict(text) };
   } catch (e) {
     console.error('⚠️  Критик не смог обратиться к мозгу (Groq):', e.message);
-    return `(сбой связи с LLM) Рецензия по «${task.title}» не сформирована.`;
+    return { text: `(сбой связи с LLM) Рецензия по «${task.title}» не сформирована.`, verdict: 'accept' };
   }
 }
