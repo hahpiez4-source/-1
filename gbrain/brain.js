@@ -57,8 +57,20 @@ export async function callLLM(messages, { temperature = 0.7, maxTokens = 600, mo
   return data?.choices?.[0]?.message?.content?.trim() || '';
 }
 
+// Блок «что рой уже знает по теме» (из общей памяти) для вставки в промпт.
+// memContext — готовый текст из памяти (или пусто). Возвращает абзац или ''.
+function memoryBlock(memContext) {
+  if (!memContext || !memContext.trim()) return '';
+  return (
+    `\nЧто рой УЖЕ знает по этой теме (из общей памяти прошлых задач). ` +
+    `Используй как справку: опирайся на проверенное, не противоречь без причины, ` +
+    `НЕ копируй вслепую — дополняй и улучшай:\n${memContext}\n`
+  );
+}
+
 // Агент думает над задачей в СВОЁМ характере. Возвращает строку-результат.
-export async function think(task, agent) {
+// memContext (необязательно) — релевантные записи из общей памяти роя.
+export async function think(task, agent, memContext = '') {
   // нет ключа — честно работаем «без мозга»
   if (!process.env.GROQ_API_KEY) {
     return `(без LLM) Задача «${task.title}» обработана. Подключи GROQ_API_KEY, чтобы агент думал по-настоящему.`;
@@ -75,6 +87,7 @@ export async function think(task, agent) {
   const userPrompt =
     `Задача: ${task.title}\n` +
     (task.description ? `Описание: ${task.description}\n` : '') +
+    memoryBlock(memContext) +
     `\nДай результат (5–8 предложений максимум).`;
 
   try {
@@ -185,11 +198,11 @@ async function tavilySearch(query) {
 // Аккуратные откаты: нет ключа Tavily → обычное think(); нет Groq → отдаём
 // сырые результаты Tavily; сбой суммаризации → тоже сырые результаты.
 // ------------------------------------------------------------
-export async function research(task) {
+export async function research(task, memContext = '') {
   // нет ключа Tavily — честно работаем без веба
   if (!hasWebSearch()) {
     console.log('ℹ️  Нет TAVILY_API_KEY — Исследователь отвечает без веб-поиска.');
-    return think(task, { name: 'Исследователь' });
+    return think(task, { name: 'Исследователь' }, memContext);
   }
 
   const query = task.description ? `${task.title}. ${task.description}` : task.title;
@@ -199,7 +212,7 @@ export async function research(task) {
     sr = await tavilySearch(query);
   } catch (e) {
     console.error('⚠️  Веб-поиск (Tavily) не удался, отвечаю в обычном режиме:', e.message);
-    return think(task, { name: 'Исследователь' });
+    return think(task, { name: 'Исследователь' }, memContext);
   }
 
   const results = Array.isArray(sr?.results) ? sr.results : [];
@@ -228,6 +241,7 @@ export async function research(task) {
   const userMsg =
     `Задача: ${task.title}\n` +
     (task.description ? `Описание: ${task.description}\n` : '') +
+    memoryBlock(memContext) +
     `\nМатериалы из интернета:\n${snippets}\n\n` +
     (sr.answer ? `Краткий ответ поисковика: ${sr.answer}\n\n` : '') +
     `Сделай сводку.`;

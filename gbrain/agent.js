@@ -66,6 +66,62 @@ async function findAgentByName(name) {
   return data ?? null;
 }
 
+// --- УМНАЯ ПАМЯТЬ: достать из задачи ключевые слова и поискать в общей памяти ---
+
+// Частые слова, которые не несут смысла для поиска — отбрасываем.
+const STOPWORDS = new Set([
+  'как', 'что', 'для', 'это', 'или', 'при', 'над', 'под', 'без', 'про', 'так',
+  'вот', 'еще', 'ещё', 'уже', 'все', 'всё', 'был', 'быть', 'есть', 'нет', 'там',
+  'тут', 'тот', 'эта', 'эти', 'нужно', 'надо', 'сделай', 'сделать', 'пожалуйста',
+  'рамках', 'цели', 'задача', 'задачи', 'результат', 'the', 'and', 'for', 'you',
+  'your', 'with', 'this', 'that',
+]);
+
+// Выделить до 6 значимых ключевых слов из текста задачи.
+function keywords(text) {
+  const words = String(text).toLowerCase().match(/[a-zа-яё0-9]+/gi) || [];
+  const seen = new Set();
+  const out = [];
+  for (const w of words) {
+    if (w.length < 3) continue;
+    if (STOPWORDS.has(w)) continue;
+    if (seen.has(w)) continue;
+    seen.add(w);
+    out.push(w);
+    if (out.length >= 6) break;
+  }
+  return out;
+}
+
+// Найти в общей памяти роя записи, релевантные задаче. Возвращает готовый
+// текстовый блок для промпта (или '' если ничего полезного не нашлось).
+async function recallContext(task) {
+  const kw = keywords(`${task.title} ${task.description || ''}`);
+  if (!kw.length) return '';
+
+  // объединяем ключевые слова через OR — так находим записи по ЛЮБОМУ из слов
+  const q = kw.join(' or ');
+  const { data, error } = await db.rpc('search_memory', { q, max_results: 4 });
+  if (error) {
+    console.error('⚠️  Поиск в памяти не удался:', error.message);
+    return '';
+  }
+  if (!data || !data.length) return '';
+
+  const lines = [];
+  for (const m of data) {
+    const body = (m.content || '').replace(/\s+/g, ' ').trim();
+    if (!body) continue;
+    // не подсовываем агенту его же текущий результат (он уже в описании задачи)
+    if (task.description && task.description.includes(body.slice(0, 80))) continue;
+    lines.push(`• ${m.title ? m.title + ': ' : ''}${body.slice(0, 280)}`);
+  }
+  if (!lines.length) return '';
+
+  console.log(`📚 Нашёл в памяти ${lines.length} релевантн. запис(ь/и) — учту в работе.`);
+  return lines.join('\n');
+}
+
 // --- ПОЧТОВЫЙ ЯЩИК: читаем письма лично нам (to_id = me.id, ещё не прочитанные) ---
 async function checkMailbox(me) {
   const { data: inbox, error } = await db
@@ -353,15 +409,20 @@ async function tick(me) {
     // если разложить не удалось — падаем ниже в обычный режим
   }
 
+  // 📚 УМНАЯ ПАМЯТЬ: перед работой ищем в общей памяти роя похожий прошлый
+  //    опыт и передаём его агенту как справку (только если есть LLM — иначе
+  //    контекст некому учитывать).
+  const memContext = hasBrain() ? await recallContext(task) : '';
+
   // 🧠 РАБОТАЕМ над задачей. Исследователь ищет в интернете (веб-поиск),
   //    остальные «думают» через обычную LLM (или заглушка, если ключа нет).
   let result;
   if (me.name === RESEARCHER) {
     console.log(hasWebSearch() ? '🔎 Ищу информацию в интернете (Tavily)...' : '🧠 Думаю над задачей (без веб-поиска)...');
-    result = await research(task);
+    result = await research(task, memContext);
   } else {
     console.log(hasBrain() ? '🧠 Думаю над задачей (LLM)...' : '⚙️  Обрабатываю (без LLM)...');
-    result = await think(task, me);
+    result = await think(task, me, memContext);
   }
   console.log(`📝 Результат:\n${result}\n`);
 
