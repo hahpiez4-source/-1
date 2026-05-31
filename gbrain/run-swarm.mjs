@@ -36,15 +36,28 @@ function printLines(label, chunk, isErr) {
   }
 }
 
-for (const p of PROCS) {
-  const child = spawn('node', [p.file], { env: { ...process.env, ...p.env } });
+// Запустить один процесс и САМ перезапускать его, если он внезапно упал
+// (для режима 24/7). При штатной остановке (stopping) — не перезапускаем.
+function launch(p) {
   const label = `${p.emoji} ${p.name.padEnd(13)}`;
+  const child = spawn('node', [p.file], { env: { ...process.env, ...p.env } });
   child.stdout.on('data', (d) => printLines(label, d, false));
   child.stderr.on('data', (d) => printLines(label, d, true));
   child.on('exit', (code) => {
-    if (!stopping) console.log(`${label} │ ⚠️  процесс завершился (код ${code})`);
+    if (stopping) return;
+    console.log(`${label} │ ⚠️  упал (код ${code}) — перезапускаю через 3 сек...`);
+    setTimeout(() => {
+      const i = children.indexOf(child);
+      const fresh = launch(p);
+      if (i !== -1) children[i] = fresh;
+      else children.push(fresh);
+    }, 3000);
   });
-  children.push(child);
+  return child;
+}
+
+for (const p of PROCS) {
+  children.push(launch(p));
   console.log(`▶️  Запущен: ${p.emoji} ${p.name}`);
 }
 
