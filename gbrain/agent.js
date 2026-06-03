@@ -17,7 +17,7 @@
 
 import 'dotenv/config';
 import { createClient } from '@supabase/supabase-js';
-import { think, plan, research, review, hasBrain, hasWebSearch } from './brain.js';
+import { think, plan, research, review, act, hasBrain, hasWebSearch } from './brain.js';
 
 const {
   SUPABASE_URL,
@@ -35,6 +35,7 @@ const POLL = Number(POLL_MS) || 5000;
 const ARCHIVIST = 'Архивариус';   // агент-хранитель памяти
 const PLANNER = 'Стратег';        // агент-планировщик: разбивает цели на подзадачи
 const RESEARCHER = 'Исследователь'; // агент с настоящим веб-поиском
+const MASTER = 'Мастер';            // агент с «руками»: веб-поиск + запуск кода (groq/compound)
 const CRITIC = 'Критик';          // агент-ревьюер: рецензирует чужие результаты
 const MAX_REWORK = 2;             // сколько раз максимум возвращать задачу на доработку
 
@@ -478,6 +479,9 @@ async function tick(me) {
   if (me.name === RESEARCHER) {
     console.log(hasWebSearch() ? '🔎 Ищу информацию в интернете (Tavily)...' : '🧠 Думаю над задачей (без веб-поиска)...');
     result = await research(task, memContext, dialog);
+  } else if (me.name === MASTER) {
+    console.log('🛠️  Берусь за дело с инструментами (веб + код, compound)...');
+    result = await act(task, memContext, dialog);
   } else {
     console.log(hasBrain() ? '🧠 Думаю над задачей (LLM)...' : '⚙️  Обрабатываю (без LLM)...');
     result = await think(task, me, memContext, dialog);

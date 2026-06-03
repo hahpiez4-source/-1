@@ -62,7 +62,9 @@ async function chooseAgent(task, agents) {
       { role: 'system', content: system },
       { role: 'user', content: user },
     ],
-    { temperature: 0, maxTokens: 20 }
+    // отдельная модель для роутинга (свой лимит токенов/минуту — разгружаем
+    // основной мозг gpt-oss). 70b выбирает агента заметно точнее, чем 8b.
+    { temperature: 0, maxTokens: 30, model: 'llama-3.3-70b-versatile' }
   );
 
   // ищем имя агента внутри ответа (LLM может добавить лишнее)

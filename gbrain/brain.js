@@ -16,6 +16,8 @@ import { getPersona } from './personas.js';
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 // Веб-поиск для Исследователя — через Tavily (поисковый API для ИИ-агентов).
 // Возвращает короткие выжимки + ссылки, поэтому надёжно укладывается в лимиты.
 const TAVILY_URL = 'https://api.tavily.com/search';
@@ -32,29 +34,59 @@ export function hasWebSearch() {
 
 // Низкоуровневый вызов LLM. messages = [{role, content}, ...].
 // Возвращает строку-ответ или бросает ошибку (вызывающий решает, что делать).
-export async function callLLM(messages, { temperature = 0.7, maxTokens = 600, model = MODEL, raw = false } = {}) {
+export async function callLLM(messages, { temperature = 0.7, maxTokens = 600, model = MODEL, raw = false, reasoningEffort } = {}) {
   const body = { model, messages, temperature };
   // max_tokens шлём, только если задан (даём возможность не ограничивать ответ).
   if (maxTokens) body.max_tokens = maxTokens;
+  // ВАЖНО: gpt-oss «думает» перед ответом, и эти токены-размышления ТОЖЕ
+  // считаются в max_tokens. Если лимит маленький — размышления съедают его и
+  // ответ приходит ПУСТОЙ. Поэтому для gpt-oss по умолчанию просим низкое
+  // усилие на размышления (можно переопределить через reasoningEffort).
+  const effort = reasoningEffort ?? (model.includes('gpt-oss') ? 'low' : undefined);
+  if (effort) body.reasoning_effort = effort;
 
-  const resp = await fetch(GROQ_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-    },
-    body: JSON.stringify(body),
-  });
+  const MAX_ATTEMPTS = 5;
+  for (let attempt = 1; ; attempt++) {
+    const resp = await fetch(GROQ_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+      },
+      body: JSON.stringify(body),
+    });
 
-  if (!resp.ok) {
+    if (resp.ok) {
+      const data = await resp.json();
+      // raw=true — вернуть весь ответ (нужно, чтобы прочитать executed_tools у compound).
+      if (raw) return data;
+      return data?.choices?.[0]?.message?.content?.trim() || '';
+    }
+
     const errText = await resp.text();
+    // Временные сбои, при которых стоит подождать и повторить:
+    //   429 — упёрлись в лимит токенов/минуту (бесплатный Groq);
+    //   5xx — сбой на стороне Groq;
+    //   400 «Tool choice is none» — редкий баг compound.
+    const transient =
+      resp.status === 429 ||
+      resp.status >= 500 ||
+      (resp.status === 400 && /tool choice is none/i.test(errText));
+    if (transient && attempt < MAX_ATTEMPTS) {
+      // сколько ждать: заголовок retry-after → подсказка Groq в тексте → экспонента
+      const ra = Number(resp.headers.get('retry-after'));
+      const hint = errText.match(/try again in ([\d.]+)s/i);
+      const waitMs = ra
+        ? ra * 1000
+        : hint
+          ? Math.ceil(parseFloat(hint[1]) * 1000) + 250
+          : Math.min(1500 * 2 ** (attempt - 1), 12000);
+      console.log(`🔁 Groq ${resp.status} — повтор ${attempt}/${MAX_ATTEMPTS} через ${Math.round(waitMs / 1000)}с`);
+      await sleep(waitMs);
+      continue;
+    }
     throw new Error(`Groq ${resp.status}: ${errText.slice(0, 200)}`);
   }
-
-  const data = await resp.json();
-  // raw=true — вернуть весь ответ (нужно, чтобы прочитать executed_tools у compound).
-  if (raw) return data;
-  return data?.choices?.[0]?.message?.content?.trim() || '';
 }
 
 // Блок «что рой уже знает по теме» (из общей памяти) для вставки в промпт.
@@ -112,7 +144,7 @@ export async function think(task, agent, memContext = '', dialog = '') {
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt },
         ],
-        { temperature: 0.7, maxTokens: 600 }
+        { temperature: 0.7, maxTokens: 1000 }
       )) || `(пустой ответ LLM) по задаче «${task.title}».`
     );
   } catch (e) {
@@ -151,7 +183,7 @@ export async function plan(task) {
         { role: 'system', content: system },
         { role: 'user', content: user },
       ],
-      { temperature: 0.4, maxTokens: 700 }
+      { temperature: 0.4, maxTokens: 1100 }
     );
   } catch (e) {
     console.error('⚠️  Стратег не смог обратиться к мозгу (Groq):', e.message);
@@ -278,6 +310,51 @@ export async function research(task, memContext = '', dialog = '') {
   }
 }
 
+// ------------------------------------------------------------
+// act(task) — РУКИ роя через groq/compound. Эта модель Groq умеет САМА
+// искать в интернете и запускать Python-код в песочнице Groq (безопасно,
+// не на нашем сервере). Для агента «Мастер».
+// Откаты: нет ключа Groq или сбой/пустой ответ → обычное think().
+// ------------------------------------------------------------
+export async function act(task, memContext = '', dialog = '') {
+  if (!process.env.GROQ_API_KEY) {
+    return think(task, { name: 'Мастер' }, memContext, dialog);
+  }
+
+  const persona = getPersona('Мастер');
+  const system =
+    persona.system +
+    '\n\nУ тебя есть РЕАЛЬНЫЕ инструменты: веб-поиск и запуск Python-кода. ' +
+    'Пользуйся ими, когда задача требует свежих данных из интернета, точных вычислений или обработки данных — ' +
+    'не выдумывай, а проверь/посчитай. ' +
+    'Отвечай на русском, по делу и с нашим дерзким тоном. В конце коротко: что сделал и какой результат.';
+
+  const user =
+    dialogBlock(dialog) +
+    `\nЗадача: ${task.title}\n` +
+    (task.description ? `Описание: ${task.description}\n` : '') +
+    memoryBlock(memContext) +
+    `\nСделай задачу. Если нужно — ищи в интернете и считай кодом.`;
+
+  try {
+    const data = await callLLM(
+      [
+        { role: 'system', content: system },
+        { role: 'user', content: user },
+      ],
+      { model: 'groq/compound', temperature: 0.5, maxTokens: 900, raw: true }
+    );
+    const msg = data?.choices?.[0]?.message || {};
+    const tools = (msg.executed_tools || []).map((t) => t.type);
+    if (tools.length) console.log(`🛠️  Мастер применил инструменты: ${tools.join(', ')}`);
+    const text = (msg.content || '').trim();
+    return text || think(task, { name: 'Мастер' }, memContext, dialog);
+  } catch (e) {
+    console.error('⚠️  Мастер (compound) не смог, отвечаю обычным режимом:', e.message);
+    return think(task, { name: 'Мастер' }, memContext, dialog);
+  }
+}
+
 // Распознать вердикт из текста рецензии: 'rework' (доработать) или 'accept' (принять).
 // Ориентируемся на финальную строку «ВЕРДИКТ: ...»; при неоднозначности — 'accept'
 // (безопаснее: не гоняем задачу по кругу зря).
@@ -323,7 +400,7 @@ export async function review(task) {
           { role: 'system', content: system },
           { role: 'user', content: userPrompt },
         ],
-        { temperature: 0.4, maxTokens: 500 }
+        { temperature: 0.4, maxTokens: 800 }
       )) || `(пустая рецензия) по задаче «${task.title}».`;
     return { text, verdict: parseVerdict(text) };
   } catch (e) {

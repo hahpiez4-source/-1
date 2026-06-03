@@ -3,7 +3,7 @@
 //
 // Поднимает разом:
 //   • ЯДРО (дирижёр)        — раздаёт задачи агентам
-//   • 5 агентов             — Takopi, Архивариус, Стратег, Исследователь, Критик
+//   • 6 агентов             — Takopi, Архивариус, Стратег, Исследователь, Мастер, Критик
 //   • Telegram-мост         — приём сообщений из Telegram
 //
 // Логи всех процессов идут сюда же, помечены цветным значком и именем.
@@ -21,6 +21,7 @@ const PROCS = [
   { name: 'Архивариус',    emoji: '🔵', file: 'agent.js',    env: { AGENT_NAME: 'Архивариус' } },
   { name: 'Стратег',       emoji: '🟡', file: 'agent.js',    env: { AGENT_NAME: 'Стратег' } },
   { name: 'Исследователь', emoji: '🟢', file: 'agent.js',    env: { AGENT_NAME: 'Исследователь' } },
+  { name: 'Мастер',        emoji: '🛠️', file: 'agent.js',    env: { AGENT_NAME: 'Мастер' } },
   { name: 'Критик',        emoji: '🔴', file: 'agent.js',    env: { AGENT_NAME: 'Критик' } },
   { name: 'Telegram',      emoji: '📨', file: 'telegram.js', env: {} },
 ];
