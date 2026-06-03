@@ -43,16 +43,43 @@ const ts = () => new Date().toLocaleTimeString();
 // task_id -> { chatId }: какие задачи ждём и куда вернуть результат.
 const pending = new Map();
 
-// --- вызов Telegram API ---
-async function tg(method, payload) {
-  const resp = await fetch(`${API}/${method}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  const data = await resp.json();
-  if (!data.ok) throw new Error(`Telegram ${method}: ${JSON.stringify(data).slice(0, 200)}`);
-  return data.result;
+// Временные сбои на стороне Telegram/сети, при которых имеет смысл просто
+// подождать и повторить запрос (а не падать с ошибкой).
+const TRANSIENT_CODES = new Set([429, 500, 502, 503, 504]);
+
+// --- вызов Telegram API (с авто-повтором при временных сбоях) ---
+async function tg(method, payload, attempt = 1) {
+  const MAX_ATTEMPTS = 5; // дальше уже бросаем ошибку наверх
+  try {
+    const resp = await fetch(`${API}/${method}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    if (!data.ok) {
+      // Временный сбой (502 Bad Gateway и т.п.) — тихо подождём и повторим.
+      if (TRANSIENT_CODES.has(data.error_code) && attempt < MAX_ATTEMPTS) {
+        const wait = data.parameters?.retry_after // Telegram сам просит подождать N сек
+          ? data.parameters.retry_after * 1000
+          : Math.min(1000 * 2 ** (attempt - 1), 15000); // 1s, 2s, 4s, 8s…
+        console.log(`🔁 Telegram ${method}: ${data.error_code} — повтор ${attempt}/${MAX_ATTEMPTS} через ${Math.round(wait / 1000)}с`);
+        await sleep(wait);
+        return tg(method, payload, attempt + 1);
+      }
+      throw new Error(`Telegram ${method}: ${JSON.stringify(data).slice(0, 200)}`);
+    }
+    return data.result;
+  } catch (e) {
+    // Обрыв сети/DNS (fetch бросил исключение, а не вернул ответ) — тоже повторяем.
+    if (e.name === 'TypeError' && attempt < MAX_ATTEMPTS) {
+      const wait = Math.min(1000 * 2 ** (attempt - 1), 15000);
+      console.log(`🔁 Telegram ${method}: сеть недоступна — повтор ${attempt}/${MAX_ATTEMPTS} через ${Math.round(wait / 1000)}с`);
+      await sleep(wait);
+      return tg(method, payload, attempt + 1);
+    }
+    throw e;
+  }
 }
 
 async function send(chatId, text) {
