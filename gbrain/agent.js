@@ -122,6 +122,60 @@ async function recallContext(task) {
   return lines.join('\n');
 }
 
+// Из описания выполненной задачи достаём ИСХОДНОЕ сообщение пользователя —
+// это всё, что идёт ДО первой пометки «--- Результат ... ---» / «--- План ... ---»
+// (её дописывает агент, когда складывает итог в описание).
+function userPartOf(desc) {
+  if (!desc) return '';
+  const m = desc.match(/\n+---\s*(Результат|План)[^\n]*---/);
+  return (m ? desc.slice(0, m.index) : desc).trim();
+}
+
+// Из описания достаём ОТВЕТ роя — содержимое ПОСЛЕДНЕЙ секции «--- Результат/План ---».
+function botPartOf(desc) {
+  if (!desc) return '';
+  const re = /---\s*(Результат|План)[^\n]*---\n/g;
+  let m;
+  let last = null;
+  while ((m = re.exec(desc)) !== null) last = m;
+  if (!last) return '';
+  return desc.slice(last.index + last[0].length).trim();
+}
+
+// --- ПАМЯТЬ ДИАЛОГА: недавняя переписка ЭТОГО чата Telegram ---
+// Берём последние выполненные задачи с тем же chat_id и восстанавливаем из них
+// пары «пользователь → рой». Возвращаем готовый текст для подсказки агенту
+// (или пусто: задача не из Telegram, либо разговор ещё пуст).
+async function recallDialog(task, limit = 4) {
+  if (!task.chat_id) return '';
+  const { data, error } = await db
+    .from('tasks')
+    .select('title, description, created_at')
+    .eq('chat_id', task.chat_id)
+    .eq('status', 'done')
+    .neq('id', task.id)
+    .order('created_at', { ascending: false })
+    .limit(limit);
+  if (error) {
+    console.error('⚠️  Не смог поднять историю диалога:', error.message);
+    return '';
+  }
+  if (!data || !data.length) return '';
+
+  // были от новых к старым — переворачиваем в хронологический порядок
+  const turns = [];
+  for (const t of data.reverse()) {
+    const user = userPartOf(t.description) || t.title;
+    const bot = botPartOf(t.description);
+    if (!user && !bot) continue;
+    turns.push(`🧑 Пользователь: ${user}\n🤖 Рой: ${bot || '(без ответа)'}`);
+  }
+  if (!turns.length) return '';
+
+  console.log(`💬 Помню ${turns.length} реплик(у/и) из этого чата — учту в ответе.`);
+  return turns.join('\n\n');
+}
+
 // --- ПОЧТОВЫЙ ЯЩИК: читаем письма лично нам (to_id = me.id, ещё не прочитанные) ---
 async function checkMailbox(me) {
   const { data: inbox, error } = await db
@@ -385,7 +439,7 @@ async function tick(me) {
     .update({ status: 'in_progress', assignee_id: me.id })
     .eq('id', candidate.id)
     .eq('status', 'todo') // ← «замок»: второй агент сюда уже не пройдёт
-    .select('id, title, description, parent_task_id, priority');
+    .select('id, title, description, parent_task_id, priority, chat_id');
 
   if (claimErr) {
     console.error('⚠️  Ошибка при бронировании задачи:', claimErr.message);
@@ -414,15 +468,19 @@ async function tick(me) {
   //    контекст некому учитывать).
   const memContext = hasBrain() ? await recallContext(task) : '';
 
+  // 💬 ПАМЯТЬ ДИАЛОГА: если задача пришла из чата Telegram — поднимаем недавнюю
+  //    переписку этого чата, чтобы агент отвечал с учётом разговора, а не с нуля.
+  const dialog = hasBrain() ? await recallDialog(task) : '';
+
   // 🧠 РАБОТАЕМ над задачей. Исследователь ищет в интернете (веб-поиск),
   //    остальные «думают» через обычную LLM (или заглушка, если ключа нет).
   let result;
   if (me.name === RESEARCHER) {
     console.log(hasWebSearch() ? '🔎 Ищу информацию в интернете (Tavily)...' : '🧠 Думаю над задачей (без веб-поиска)...');
-    result = await research(task, memContext);
+    result = await research(task, memContext, dialog);
   } else {
     console.log(hasBrain() ? '🧠 Думаю над задачей (LLM)...' : '⚙️  Обрабатываю (без LLM)...');
-    result = await think(task, me, memContext);
+    result = await think(task, me, memContext, dialog);
   }
   console.log(`📝 Результат:\n${result}\n`);
 

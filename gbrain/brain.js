@@ -68,9 +68,20 @@ function memoryBlock(memContext) {
   );
 }
 
+// Блок «о чём этот чат говорил раньше» (память диалога) для вставки в промпт.
+// dialog — готовый текст недавней переписки (или пусто). Возвращает абзац или ''.
+function dialogBlock(dialog) {
+  if (!dialog || !dialog.trim()) return '';
+  return (
+    `\nПредыдущий разговор с этим пользователем (для контекста — НЕ отвечай ` +
+    `на старые реплики заново, просто помни, о чём шла речь, и держи нить беседы):\n${dialog}\n`
+  );
+}
+
 // Агент думает над задачей в СВОЁМ характере. Возвращает строку-результат.
 // memContext (необязательно) — релевантные записи из общей памяти роя.
-export async function think(task, agent, memContext = '') {
+// dialog (необязательно) — недавняя переписка этого чата (память диалога).
+export async function think(task, agent, memContext = '', dialog = '') {
   // нет ключа — честно работаем «без мозга»
   if (!process.env.GROQ_API_KEY) {
     return `(без LLM) Задача «${task.title}» обработана. Подключи GROQ_API_KEY, чтобы агент думал по-настоящему.`;
@@ -87,7 +98,8 @@ export async function think(task, agent, memContext = '') {
     `Если задача расплывчатая — не докапывайся уточнениями, а сделай разумное предположение и сразу предложи конкретику.`;
 
   const userPrompt =
-    `Задача: ${task.title}\n` +
+    dialogBlock(dialog) +
+    `\nЗадача (новое сообщение пользователя — отвечай именно на него): ${task.title}\n` +
     (task.description ? `Описание: ${task.description}\n` : '') +
     memoryBlock(memContext) +
     `\nДай результат (5–8 предложений максимум).`;
@@ -200,11 +212,11 @@ async function tavilySearch(query) {
 // Аккуратные откаты: нет ключа Tavily → обычное think(); нет Groq → отдаём
 // сырые результаты Tavily; сбой суммаризации → тоже сырые результаты.
 // ------------------------------------------------------------
-export async function research(task, memContext = '') {
+export async function research(task, memContext = '', dialog = '') {
   // нет ключа Tavily — честно работаем без веба
   if (!hasWebSearch()) {
     console.log('ℹ️  Нет TAVILY_API_KEY — Исследователь отвечает без веб-поиска.');
-    return think(task, { name: 'Исследователь' }, memContext);
+    return think(task, { name: 'Исследователь' }, memContext, dialog);
   }
 
   const query = task.description ? `${task.title}. ${task.description}` : task.title;
@@ -214,7 +226,7 @@ export async function research(task, memContext = '') {
     sr = await tavilySearch(query);
   } catch (e) {
     console.error('⚠️  Веб-поиск (Tavily) не удался, отвечаю в обычном режиме:', e.message);
-    return think(task, { name: 'Исследователь' }, memContext);
+    return think(task, { name: 'Исследователь' }, memContext, dialog);
   }
 
   const results = Array.isArray(sr?.results) ? sr.results : [];
@@ -241,7 +253,8 @@ export async function research(task, memContext = '') {
     'В конце ОБЯЗАТЕЛЬНО добавь раздел «Источники:» со списком ссылок.';
 
   const userMsg =
-    `Задача: ${task.title}\n` +
+    dialogBlock(dialog) +
+    `\nЗадача: ${task.title}\n` +
     (task.description ? `Описание: ${task.description}\n` : '') +
     memoryBlock(memContext) +
     `\nМатериалы из интернета:\n${snippets}\n\n` +

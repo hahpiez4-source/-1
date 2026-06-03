@@ -167,7 +167,7 @@ async function handleMessage(msg) {
   const title = text.length > 80 ? text.slice(0, 77) + '…' : text;
   const { data: task, error } = await db
     .from('tasks')
-    .insert({ title, description: text, status: 'todo', priority: 2 })
+    .insert({ title, description: text, status: 'todo', priority: 2, chat_id: chatId })
     .select('id')
     .single();
 
