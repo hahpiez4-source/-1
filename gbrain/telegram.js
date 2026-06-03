@@ -17,6 +17,10 @@
 
 import 'dotenv/config';
 import { createClient } from '@supabase/supabase-js';
+import { spawn } from 'node:child_process';
+import { readFile, unlink } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const {
   SUPABASE_URL,
@@ -36,6 +40,12 @@ if (!TELEGRAM_BOT_TOKEN) {
 
 const API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 const db = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSession: false } });
+
+// --- ГОЛОС (TTS через Piper) ---
+// VOICE_ENABLED=1 — озвучивать ответы; путь к движку и модели можно задать в .env.
+const VOICE_ENABLED = process.env.VOICE_ENABLED === '1';
+const PIPER_BIN = process.env.PIPER_BIN || '/root/piper/venv/bin/piper';
+const PIPER_MODEL = process.env.PIPER_MODEL || '/root/piper/ru_RU-irina-medium.onnx';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const ts = () => new Date().toLocaleTimeString();
@@ -90,6 +100,73 @@ async function send(chatId, text) {
   }
 }
 
+// Готовим текст к озвучке: убираем эмодзи и markdown (TTS читал бы их вслух),
+// схлопываем пробелы и обрезаем «простыни» (длинный звук никто не дослушает).
+function stripForTTS(text) {
+  return String(text || '')
+    .replace(/\p{Extended_Pictographic}/gu, '') // эмодзи
+    .replace(/[*_`#>]/g, '') // символы разметки
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 1500);
+}
+
+// Запустить внешнюю программу, отдав ей текст в stdin. Промис: ок/ошибка.
+function run(cmd, cmdArgs, stdinData) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(cmd, cmdArgs);
+    let err = '';
+    p.stderr.on('data', (d) => (err += d));
+    p.on('error', reject);
+    p.on('close', (code) =>
+      code === 0 ? resolve() : reject(new Error(`${cmd} вышел с кодом ${code}: ${err.slice(0, 200)}`))
+    );
+    if (stdinData != null) {
+      p.stdin.write(stdinData);
+      p.stdin.end();
+    }
+  });
+}
+
+// Текст → голосовое ogg/opus. Возвращает путь к .ogg (и .wav для уборки) или null.
+async function textToVoice(text) {
+  const clean = stripForTTS(text);
+  if (!clean) return null;
+  const base = join(tmpdir(), `gbrain-voice-${crypto.randomUUID()}`);
+  const wav = `${base}.wav`;
+  const ogg = `${base}.ogg`;
+  await run(PIPER_BIN, ['-m', PIPER_MODEL, '-f', wav], clean); // синтез речи
+  await run('ffmpeg', ['-y', '-i', wav, '-c:a', 'libopus', '-b:a', '32k', ogg]); // в формат голосовых
+  return { ogg, wav };
+}
+
+// Озвучить текст и отправить голосовым сообщением. Любой сбой — тихо логируем
+// (текст пользователь уже получил, голос — приятный бонус, не критично).
+async function sendVoice(chatId, text) {
+  if (!VOICE_ENABLED) return;
+  let files = null;
+  try {
+    files = await textToVoice(text);
+    if (!files) return;
+    const buf = await readFile(files.ogg);
+    const form = new FormData();
+    form.append('chat_id', String(chatId));
+    form.append('voice', new Blob([buf], { type: 'audio/ogg' }), 'voice.ogg');
+    const resp = await fetch(`${API}/sendVoice`, { method: 'POST', body: form });
+    const data = await resp.json();
+    if (!data.ok) throw new Error(`sendVoice: ${JSON.stringify(data).slice(0, 200)}`);
+    console.log(`🎙️  [${ts()}] Голосовое отправлено → чат ${chatId}.`);
+  } catch (e) {
+    console.error('⚠️  Не смог отправить голос:', e.message);
+  } finally {
+    // прибираем за собой временные файлы
+    if (files) {
+      unlink(files.wav).catch(() => {});
+      unlink(files.ogg).catch(() => {});
+    }
+  }
+}
+
 // Достать из описания задачи именно РЕЗУЛЬТАТ (или ПЛАН), игнорируя замечания
 // Критика. Берём содержимое последней секции «--- Результат ... ---» / «--- План ... ---».
 function extractResult(desc) {
@@ -127,8 +204,10 @@ async function watchResults() {
             if (t.status === 'done') {
               // ревью отключено: отправляем сразу, как только задача готова
               pending.delete(t.id);
-              await send(entry.chatId, extractResult(t.description));
+              const reply = extractResult(t.description);
+              await send(entry.chatId, reply); // текст
               console.log(`📤 [${ts()}] Результат задачи ${t.id} → чат ${entry.chatId}.`);
+              await sendVoice(entry.chatId, reply); // + голос (если включён)
             }
           }
         }
