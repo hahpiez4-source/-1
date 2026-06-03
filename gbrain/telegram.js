@@ -46,6 +46,11 @@ const db = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSes
 const VOICE_ENABLED = process.env.VOICE_ENABLED === '1';
 const PIPER_BIN = process.env.PIPER_BIN || '/root/piper/venv/bin/piper';
 const PIPER_MODEL = process.env.PIPER_MODEL || '/root/piper/ru_RU-irina-medium.onnx';
+// VOICE_ROBOT=1 — пропускать голос через «робото-эффект» (металлический вокодер:
+// обнуляем фазу спектра → речь звучит роботизированно, но остаётся разборчивой).
+const VOICE_ROBOT = process.env.VOICE_ROBOT === '1';
+const ROBOT_AF =
+  "afftfilt=real='hypot(re,im)*sin(0)':imag='hypot(re,im)*cos(0)':win_size=512:overlap=0.75";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const ts = () => new Date().toLocaleTimeString();
@@ -136,7 +141,10 @@ async function textToVoice(text) {
   const wav = `${base}.wav`;
   const ogg = `${base}.ogg`;
   await run(PIPER_BIN, ['-m', PIPER_MODEL, '-f', wav], clean); // синтез речи
-  await run('ffmpeg', ['-y', '-i', wav, '-c:a', 'libopus', '-b:a', '32k', ogg]); // в формат голосовых
+  const ffArgs = ['-y', '-i', wav];
+  if (VOICE_ROBOT) ffArgs.push('-af', ROBOT_AF); // робото-эффект (если включён)
+  ffArgs.push('-c:a', 'libopus', '-b:a', '32k', ogg); // в формат голосовых
+  await run('ffmpeg', ffArgs);
   return { ogg, wav };
 }
 
