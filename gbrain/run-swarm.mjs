@@ -22,6 +22,7 @@ const PROCS = [
   { name: 'Стратег',       emoji: '🟡', file: 'agent.js',    env: { AGENT_NAME: 'Стратег' } },
   { name: 'Исследователь', emoji: '🟢', file: 'agent.js',    env: { AGENT_NAME: 'Исследователь' } },
   { name: 'Мастер',        emoji: '🛠️', file: 'agent.js',    env: { AGENT_NAME: 'Мастер' } },
+  { name: 'Секретарь',     emoji: '📅', file: 'agent.js',    env: { AGENT_NAME: 'Секретарь' } },
   { name: 'Критик',        emoji: '🔴', file: 'agent.js',    env: { AGENT_NAME: 'Критик' } },
   { name: 'Telegram',      emoji: '📨', file: 'telegram.js', env: {} },
 ];

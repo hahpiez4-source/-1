@@ -18,7 +18,7 @@
 
 import 'dotenv/config';
 import { createClient } from '@supabase/supabase-js';
-import { callLLM, hasBrain } from './brain.js';
+import { callLLM, hasBrain, looksLikeOrganizerTask } from './brain.js';
 import { getPersona } from './personas.js';
 
 const { SUPABASE_URL, SUPABASE_SERVICE_KEY, POLL_MS = '4000' } = process.env;
@@ -103,10 +103,19 @@ async function tick() {
   }
   if (!tasks || tasks.length === 0) return false;
 
+  // есть ли в рое Секретарь (агент с руками в Google)
+  const secretary = agents.find((a) => a.name === 'Секретарь');
+
   for (const task of tasks) {
     let chosenName = null;
 
-    if (hasBrain()) {
+    // ДЕТЕРМИНИРОВАННО: задачи про календарь/события/напоминания/Диск — Секретарю,
+    // без LLM-гадания (иначе их перехватывает случайный агент и выдумывает результат).
+    if (secretary && looksLikeOrganizerTask(`${task.title} ${task.description || ''}`)) {
+      chosenName = secretary.name;
+    }
+
+    if (!chosenName && hasBrain()) {
       try {
         chosenName = await chooseAgent(task, agents);
       } catch (e) {

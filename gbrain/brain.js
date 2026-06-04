@@ -12,6 +12,16 @@
 // ============================================================
 
 import { getPersona } from './personas.js';
+import {
+  hasGoogle,
+  createCalendarEvent,
+  listCalendarEvents,
+  createTask,
+  listTasks,
+  createDriveFolder,
+  createDriveDoc,
+  GOOGLE_TZ,
+} from './google.js';
 
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
@@ -34,10 +44,13 @@ export function hasWebSearch() {
 
 // Низкоуровневый вызов LLM. messages = [{role, content}, ...].
 // Возвращает строку-ответ или бросает ошибку (вызывающий решает, что делать).
-export async function callLLM(messages, { temperature = 0.7, maxTokens = 600, model = MODEL, raw = false, reasoningEffort } = {}) {
+export async function callLLM(messages, { temperature = 0.7, maxTokens = 600, model = MODEL, raw = false, reasoningEffort, tools, toolChoice } = {}) {
   const body = { model, messages, temperature };
   // max_tokens шлём, только если задан (даём возможность не ограничивать ответ).
   if (maxTokens) body.max_tokens = maxTokens;
+  // function-calling: список инструментов (для агента с «руками», напр. Секретарь).
+  if (tools) body.tools = tools;
+  if (toolChoice) body.tool_choice = toolChoice;
   // ВАЖНО: gpt-oss «думает» перед ответом, и эти токены-размышления ТОЖЕ
   // считаются в max_tokens. Если лимит маленький — размышления съедают его и
   // ответ приходит ПУСТОЙ. Поэтому для gpt-oss по умолчанию просим низкое
@@ -352,6 +365,250 @@ export async function act(task, memContext = '', dialog = '') {
   } catch (e) {
     console.error('⚠️  Мастер (compound) не смог, отвечаю обычным режимом:', e.message);
     return think(task, { name: 'Мастер' }, memContext, dialog);
+  }
+}
+
+// ------------------------------------------------------------
+// secretary(task) — РУКИ роя в Google (для агента «Секретарь»).
+// Через function-calling Groq модель сама решает, какое действие в Google
+// выполнить (создать событие/задачу/папку/документ или показать список),
+// мы РЕАЛЬНО его выполняем через google.js и отдаём модели результат, после
+// чего она пишет человеку короткий ответ. Без ключей Google — откат в think().
+// ------------------------------------------------------------
+
+export function hasGoogleHands() {
+  return hasGoogle();
+}
+
+// Похожа ли задача на «секретарскую» (Google: календарь / события / напоминания /
+// расписание / Диск)? Используется для ДЕТЕРМИНИРОВАННОЙ маршрутизации к Секретарю,
+// чтобы такие задачи не перехватывал случайный агент и не выдумывал результат.
+// Слово «задача» намеренно НЕ берём — оно совпадает с задачами доски роя.
+const ORGANIZER_RE =
+  /(календар|событие|событи[яйе]|встреч|напомн|напоминани|расписани|дедлайн|ежедневник|google\s*calendar|гугл\s*календар|гугл\s*диск|google\s*drive|на\s*диске|папк[уа]|гугл\s*док|google\s*doc|документ на)/i;
+
+export function looksLikeOrganizerTask(text) {
+  return ORGANIZER_RE.test(String(text || ''));
+}
+
+// Описание инструментов для модели (OpenAI-совместимый формат function-calling).
+const GOOGLE_TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'create_calendar_event',
+      description:
+        'Создать событие в Google Календаре пользователя. Время указывай как локальное ' +
+        'в формате ГГГГ-ММ-ДДTЧЧ:ММ:СС (например 2026-06-05T15:00:00). Для события на весь день ' +
+        'ставь all_day=true и start как ГГГГ-ММ-ДД.',
+      parameters: {
+        type: 'object',
+        properties: {
+          summary: { type: 'string', description: 'Название события' },
+          start: { type: 'string', description: 'Начало: ГГГГ-ММ-ДДTЧЧ:ММ:СС или ГГГГ-ММ-ДД (для all_day)' },
+          end: { type: 'string', description: 'Конец (необязательно; по умолчанию +1 час)' },
+          description: { type: 'string', description: 'Заметка к событию (необязательно)' },
+          all_day: { type: 'boolean', description: 'Событие на весь день' },
+        },
+        required: ['summary', 'start'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'list_calendar_events',
+      description: 'Показать ближайшие события из Google Календаря (по умолчанию на 7 дней вперёд).',
+      parameters: {
+        type: 'object',
+        properties: { max: { type: 'integer', description: 'Сколько событий максимум (по умолч. 10)' } },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'create_task',
+      description:
+        'Создать задачу/напоминание в Google Задачах. Внимание: у задачи хранится только ДАТА срока ' +
+        '(время игнорируется). Если нужно напоминание на конкретное ВРЕМЯ — используй create_calendar_event.',
+      parameters: {
+        type: 'object',
+        properties: {
+          title: { type: 'string', description: 'Текст задачи' },
+          notes: { type: 'string', description: 'Подробности (необязательно)' },
+          due: { type: 'string', description: 'Срок — дата ГГГГ-ММ-ДД (необязательно)' },
+        },
+        required: ['title'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'list_tasks',
+      description: 'Показать текущие (невыполненные) задачи из Google Задач.',
+      parameters: { type: 'object', properties: { max: { type: 'integer' } } },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'create_drive_folder',
+      description: 'Создать папку на Google Диске.',
+      parameters: {
+        type: 'object',
+        properties: { name: { type: 'string', description: 'Имя папки' } },
+        required: ['name'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'create_drive_doc',
+      description: 'Создать Google-документ на Диске с текстом.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Имя документа' },
+          content: { type: 'string', description: 'Текст документа (необязательно)' },
+        },
+        required: ['name'],
+      },
+    },
+  },
+];
+
+// Реальное выполнение инструмента. Возвращает объект-результат (его увидит модель).
+async function runGoogleTool(name, args) {
+  switch (name) {
+    case 'create_calendar_event':
+      return await createCalendarEvent({
+        summary: args.summary,
+        start: args.start,
+        end: args.end,
+        description: args.description,
+        allDay: Boolean(args.all_day),
+      });
+    case 'list_calendar_events':
+      return { events: await listCalendarEvents({ max: args.max || 10 }) };
+    case 'create_task':
+      return await createTask({ title: args.title, notes: args.notes, due: args.due });
+    case 'list_tasks':
+      return { tasks: await listTasks({ max: args.max || 20 }) };
+    case 'create_drive_folder':
+      return await createDriveFolder({ name: args.name });
+    case 'create_drive_doc':
+      return await createDriveDoc({ name: args.name, content: args.content || '' });
+    default:
+      throw new Error(`неизвестный инструмент: ${name}`);
+  }
+}
+
+// Текущая дата/время в часовом поясе пользователя — чтобы модель верно понимала
+// «завтра», «в пятницу», «через час» и т.п.
+function nowInTz() {
+  try {
+    const f = new Intl.DateTimeFormat('ru-RU', {
+      timeZone: GOOGLE_TZ,
+      weekday: 'long', year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', hour12: false,
+    });
+    return f.format(new Date());
+  } catch {
+    return new Date().toISOString();
+  }
+}
+
+export async function secretary(task, memContext = '', dialog = '') {
+  // нет ключей Google — честно работаем как обычный агент
+  if (!hasGoogle()) {
+    console.log('ℹ️  Нет ключей Google — Секретарь отвечает без доступа к Календарю/Задачам/Диску.');
+    return think(task, { name: 'Секретарь' }, memContext, dialog);
+  }
+  if (!process.env.GROQ_API_KEY) {
+    return think(task, { name: 'Секретарь' }, memContext, dialog);
+  }
+
+  const persona = getPersona('Секретарь');
+  const system =
+    persona.system +
+    `\n\nУ тебя есть РЕАЛЬНЫЙ доступ к Google пользователя через инструменты: ` +
+    `Календарь (создать/показать события), Задачи (создать/показать напоминания), Диск (создать папку/документ). ` +
+    `Когда просьба про события, встречи, напоминания, задачи, папки или документы — НЕ описывай словами, ` +
+    `а ВЫЗОВИ нужный инструмент и реально сделай. ` +
+    `Часовой пояс пользователя: ${GOOGLE_TZ}. Сейчас: ${nowInTz()}. ` +
+    `Считай относительные даты («завтра», «в пятницу», «через час») от этого момента и передавай инструменту точное время. ` +
+    `Для напоминания на конкретное ВРЕМЯ создавай событие в календаре (у Задач хранится только дата). ` +
+    `После действия дай человеку короткий ответ на русском в нашем дерзком тоне: что именно сделал ` +
+    `(с названием и временем), без воды. Если включал ссылку — добавь её.`;
+
+  const userMsg =
+    dialogBlock(dialog) +
+    `\nПросьба пользователя: ${task.title}\n` +
+    (task.description ? `Описание: ${task.description}\n` : '') +
+    memoryBlock(memContext);
+
+  const messages = [
+    { role: 'system', content: system },
+    { role: 'user', content: userMsg },
+  ];
+
+  const actionsLog = [];
+  const MAX_STEPS = 5; // максимум вызовов инструментов за одну задачу
+  try {
+    for (let step = 0; step < MAX_STEPS; step++) {
+      const data = await callLLM(messages, {
+        model: 'llama-3.3-70b-versatile', // надёжно поддерживает function-calling
+        temperature: 0.3,
+        maxTokens: 900,
+        raw: true,
+        tools: GOOGLE_TOOLS,
+      });
+      const msg = data?.choices?.[0]?.message || {};
+      const calls = msg.tool_calls || [];
+
+      // модель не зовёт инструменты — значит выдала финальный текст
+      if (!calls.length) {
+        const text = (msg.content || '').trim();
+        if (actionsLog.length) console.log(`📅 Секретарь сделал: ${actionsLog.join('; ')}`);
+        return text || (actionsLog.length ? `Готово: ${actionsLog.join('; ')}.` : `Не понял, что сделать с «${task.title}».`);
+      }
+
+      // кладём ответ модели (с tool_calls) в историю, затем выполняем каждый вызов
+      messages.push(msg);
+      for (const call of calls) {
+        let args = {};
+        try {
+          args = JSON.parse(call.function.arguments || '{}');
+        } catch {}
+        let resultObj;
+        try {
+          resultObj = await runGoogleTool(call.function.name, args);
+          actionsLog.push(`${call.function.name}(${args.summary || args.title || args.name || ''})`.trim());
+          console.log(`🔧 ${call.function.name}:`, JSON.stringify(resultObj).slice(0, 160));
+        } catch (e) {
+          resultObj = { error: e.message };
+          console.error(`⚠️  Инструмент ${call.function.name} упал:`, e.message);
+        }
+        messages.push({
+          role: 'tool',
+          tool_call_id: call.id,
+          content: JSON.stringify(resultObj),
+        });
+      }
+    }
+    // исчерпали лимит шагов — попросим модель подвести итог без инструментов
+    const finalText = await callLLM(messages, {
+      model: 'llama-3.3-70b-versatile',
+      temperature: 0.3,
+      maxTokens: 500,
+    });
+    return finalText || (actionsLog.length ? `Готово: ${actionsLog.join('; ')}.` : 'Готово.');
+  } catch (e) {
+    console.error('⚠️  Секретарь не смог (Google/Groq):', e.message);
+    return think(task, { name: 'Секретарь' }, memContext, dialog);
   }
 }
 
