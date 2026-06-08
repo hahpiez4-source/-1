@@ -11,7 +11,7 @@
 // При отсутствии ключа/ошибке — аккуратная заглушка, рой не падает.
 // ============================================================
 
-import { getPersona } from './personas.js';
+import { getPersona } from './roster.js';
 import {
   hasGoogle,
   createCalendarEvent,
@@ -265,7 +265,12 @@ export async function research(task, memContext = '', dialog = '') {
     return think(task, { name: 'Исследователь' }, memContext, dialog);
   }
 
-  const query = task.description ? `${task.title}. ${task.description}` : task.title;
+  // Tavily ограничивает запрос 400 символами. Заголовок (он короткий) берём
+  // целиком, описание добавляем, сколько влезет в лимит — иначе Tavily вернёт
+  // 400 «Query is too long» (бывало на доработках, где в описании копятся
+  // замечания Критика) и веб-поиск зря откатывался в режим без интернета.
+  const MAX_TAVILY_QUERY = 400;
+  const query = (task.description ? `${task.title}. ${task.description}` : task.title).slice(0, MAX_TAVILY_QUERY);
 
   let sr;
   try {
@@ -378,17 +383,6 @@ export async function act(task, memContext = '', dialog = '') {
 
 export function hasGoogleHands() {
   return hasGoogle();
-}
-
-// Похожа ли задача на «секретарскую» (Google: календарь / события / напоминания /
-// расписание / Диск)? Используется для ДЕТЕРМИНИРОВАННОЙ маршрутизации к Секретарю,
-// чтобы такие задачи не перехватывал случайный агент и не выдумывал результат.
-// Слово «задача» намеренно НЕ берём — оно совпадает с задачами доски роя.
-const ORGANIZER_RE =
-  /(календар|событие|событи[яйе]|встреч|напомн|напоминани|расписани|дедлайн|ежедневник|google\s*calendar|гугл\s*календар|гугл\s*диск|google\s*drive|на\s*диске|папк[уа]|гугл\s*док|google\s*doc|документ на)/i;
-
-export function looksLikeOrganizerTask(text) {
-  return ORGANIZER_RE.test(String(text || ''));
 }
 
 // Описание инструментов для модели (OpenAI-совместимый формат function-calling).

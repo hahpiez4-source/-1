@@ -17,7 +17,8 @@
 
 import 'dotenv/config';
 import { createClient } from '@supabase/supabase-js';
-import { think, plan, research, review, act, secretary, hasBrain, hasWebSearch, looksLikeOrganizerTask } from './brain.js';
+import { think, plan, research, review, act, secretary, hasBrain, hasWebSearch } from './brain.js';
+import { getAgent, roleHolder, isOrganizerTask } from './roster.js';
 
 const {
   SUPABASE_URL,
@@ -32,13 +33,30 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
 }
 
 const POLL = Number(POLL_MS) || 5000;
-const ARCHIVIST = 'Архивариус';   // агент-хранитель памяти
-const PLANNER = 'Стратег';        // агент-планировщик: разбивает цели на подзадачи
-const RESEARCHER = 'Исследователь'; // агент с настоящим веб-поиском
-const MASTER = 'Мастер';            // агент с «руками»: веб-поиск + запуск кода (groq/compound)
-const SECRETARY = 'Секретарь';      // агент с доступом в Google: Календарь, Задачи, Диск
-const CRITIC = 'Критик';          // агент-ревьюер: рецензирует чужие результаты
-const MAX_REWORK = 2;             // сколько раз максимум возвращать задачу на доработку
+// Кто у нас Архивариус (хранитель памяти) — берём из реестра, не зашиваем имя.
+// Ему агенты шлют итоги работы «в память». Роли остальных агентов проверяем
+// по флагам/handler из реестра (getAgent), а не по сравнению имён.
+const ARCHIVIST = roleHolder('archivist') || 'Архивариус';
+const MAX_REWORK = 2; // сколько раз максимум возвращать задачу на доработку
+
+// Чем агент ВЫПОЛНЯЕТ задачу — по его handler из реестра. Сигнатуры у функций
+// мозга разные, поэтому оборачиваем каждую под единый вызов (task → результат).
+function runHandler(meDef, me, task, memContext, dialog) {
+  switch (meDef.handler) {
+    case 'research':
+      console.log(hasWebSearch() ? '🔎 Ищу информацию в интернете (Tavily)...' : '🧠 Думаю над задачей (без веб-поиска)...');
+      return research(task, memContext, dialog);
+    case 'act':
+      console.log('🛠️  Берусь за дело с инструментами (веб + код, compound)...');
+      return act(task, memContext, dialog);
+    case 'secretary':
+      console.log('📅 Берусь за дело в Google (Календарь / Задачи / Диск)...');
+      return secretary(task, memContext, dialog);
+    default:
+      console.log(hasBrain() ? '🧠 Думаю над задачей (LLM)...' : '⚙️  Обрабатываю (без LLM)...');
+      return think(task, me, memContext, dialog);
+  }
+}
 
 const db = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
   auth: { persistSession: false },
@@ -203,7 +221,7 @@ async function checkMailbox(me) {
     await db.from('messages').update({ read_at: now() }).eq('id', letter.id);
 
     // РЕАКЦИЯ: если я Архивариус — сохраняю содержимое в общую память и отвечаю отправителю.
-    if (me.name === ARCHIVIST) {
+    if (getAgent(me.name).archivist) {
       await db.from('memory').insert({
         agent_id: me.id,
         kind: 'note',
@@ -304,12 +322,12 @@ async function reviewDoneTasks(me) {
   // Секретаря повторить действие и создать ДУБЛИКАТ события/задачи. Помечаем их
   // отрецензированными, чтобы не висели, и пропускаем.
   for (const r of rows || []) {
-    if (looksLikeOrganizerTask(`${r.title} ${r.description || ''}`)) {
+    if (isOrganizerTask(`${r.title} ${r.description || ''}`)) {
       await db.from('tasks').update({ reviewed_at: now() }).eq('id', r.id).is('reviewed_at', null);
     }
   }
   const task = (rows || []).find(
-    (r) => !looksLikeOrganizerTask(`${r.title} ${r.description || ''}`)
+    (r) => !isOrganizerTask(`${r.title} ${r.description || ''}`)
   );
   if (!task) return false;
 
@@ -390,6 +408,7 @@ async function reviewDoneTasks(me) {
 
 // Один круг дежурства. Возвращает true, если была активность (можно сразу повторить).
 async function tick(me) {
+  const meDef = getAgent(me.name); // моя запись в реестре: роль, handler, флаги
   await db.from('agents').update({ last_seen: now() }).eq('id', me.id);
 
   // 0) сначала разбираем почту
@@ -397,7 +416,7 @@ async function tick(me) {
 
   // 0.5) КРИТИК: его главная работа — рецензировать чужие готовые результаты.
   //      Если есть что рецензировать — делаем это и идём на новый круг.
-  if (me.name === CRITIC) {
+  if (meDef.critic) {
     const reviewed = await reviewDoneTasks(me);
     if (reviewed) return true;
     // нечего рецензировать — Критик ниже может взять обычную задачу (если назначат)
@@ -439,9 +458,9 @@ async function tick(me) {
     // «Ничьи» задачи про Google (календарь/события/напоминания/Диск) берёт ТОЛЬКО
     // Секретарь — у остальных нет рук в Google, иначе они выдумают результат.
     const pool =
-      me.name === SECRETARY
+      meDef.organizer
         ? free.data || []
-        : (free.data || []).filter((t) => !looksLikeOrganizerTask(`${t.title} ${t.description || ''}`));
+        : (free.data || []).filter((t) => !isOrganizerTask(`${t.title} ${t.description || ''}`));
     candidate = pool[0] ?? null;
   }
 
@@ -475,7 +494,7 @@ async function tick(me) {
   // 🧭 СТРАТЕГ: если это КОРНЕВАЯ цель (без родителя) — раскладываем её на подзадачи.
   //    Подзадачи (у которых parent_task_id уже задан) Стратег выполняет как обычные —
   //    это защита от бесконечного дробления.
-  if (me.name === PLANNER && !task.parent_task_id) {
+  if (meDef.planner && !task.parent_task_id) {
     const handled = await decompose(me, task);
     if (handled) return true;
     // если разложить не удалось — падаем ниже в обычный режим
@@ -490,22 +509,10 @@ async function tick(me) {
   //    переписку этого чата, чтобы агент отвечал с учётом разговора, а не с нуля.
   const dialog = hasBrain() ? await recallDialog(task) : '';
 
-  // 🧠 РАБОТАЕМ над задачей. Исследователь ищет в интернете (веб-поиск),
-  //    остальные «думают» через обычную LLM (или заглушка, если ключа нет).
-  let result;
-  if (me.name === RESEARCHER) {
-    console.log(hasWebSearch() ? '🔎 Ищу информацию в интернете (Tavily)...' : '🧠 Думаю над задачей (без веб-поиска)...');
-    result = await research(task, memContext, dialog);
-  } else if (me.name === MASTER) {
-    console.log('🛠️  Берусь за дело с инструментами (веб + код, compound)...');
-    result = await act(task, memContext, dialog);
-  } else if (me.name === SECRETARY) {
-    console.log('📅 Берусь за дело в Google (Календарь / Задачи / Диск)...');
-    result = await secretary(task, memContext, dialog);
-  } else {
-    console.log(hasBrain() ? '🧠 Думаю над задачей (LLM)...' : '⚙️  Обрабатываю (без LLM)...');
-    result = await think(task, me, memContext, dialog);
-  }
+  // 🧠 РАБОТАЕМ над задачей способом из реестра (handler): Исследователь ищет в
+  //    интернете, Мастер берётся руками (веб+код), Секретарь — в Google, остальные
+  //    «думают» обычной LLM (или заглушка, если ключа нет).
+  const result = await runHandler(meDef, me, task, memContext, dialog);
   console.log(`📝 Результат:\n${result}\n`);
 
   // сохраняем результат прямо в задачу (в описание дописываем итог)
@@ -516,7 +523,7 @@ async function tick(me) {
   console.log('✅ Готово.');
 
   // 3) отчитываемся. Если есть Архивариус (и это не я сам) — пересылаем ему РЕЗУЛЬТАТ в память.
-  const archivist = me.name === ARCHIVIST ? null : await findAgentByName(ARCHIVIST);
+  const archivist = meDef.archivist ? null : await findAgentByName(ARCHIVIST);
   if (archivist) {
     await db.from('messages').insert({
       from_id: me.id,

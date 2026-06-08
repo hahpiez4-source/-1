@@ -13,18 +13,15 @@
 // ============================================================
 
 import { spawn } from 'node:child_process';
+import { AGENT_PROCS } from './roster.js';
 
-// Что запускаем. Для агентов передаём AGENT_NAME (dotenv его не перетирает).
+// Что запускаем: ЯДРО (дирижёр) + все агенты ИЗ РЕЕСТРА (roster.js) + Telegram-мост.
+// Список агентов больше НЕ дублируется здесь — он берётся из реестра, поэтому
+// новый агент появляется в запуске автоматически, как только добавлен в roster.js.
 const PROCS = [
-  { name: 'ЯДРО',          emoji: '🧩', file: 'gbrain.js',   env: {} },
-  { name: 'Takopi',        emoji: '🟣', file: 'agent.js',    env: { AGENT_NAME: 'Takopi' } },
-  { name: 'Архивариус',    emoji: '🔵', file: 'agent.js',    env: { AGENT_NAME: 'Архивариус' } },
-  { name: 'Стратег',       emoji: '🟡', file: 'agent.js',    env: { AGENT_NAME: 'Стратег' } },
-  { name: 'Исследователь', emoji: '🟢', file: 'agent.js',    env: { AGENT_NAME: 'Исследователь' } },
-  { name: 'Мастер',        emoji: '🛠️', file: 'agent.js',    env: { AGENT_NAME: 'Мастер' } },
-  { name: 'Секретарь',     emoji: '📅', file: 'agent.js',    env: { AGENT_NAME: 'Секретарь' } },
-  { name: 'Критик',        emoji: '🔴', file: 'agent.js',    env: { AGENT_NAME: 'Критик' } },
-  { name: 'Telegram',      emoji: '📨', file: 'telegram.js', env: {} },
+  { name: 'ЯДРО', emoji: '🧩', file: 'gbrain.js', env: {} },
+  ...AGENT_PROCS,
+  { name: 'Telegram', emoji: '📨', file: 'telegram.js', env: {} },
 ];
 
 const children = [];
