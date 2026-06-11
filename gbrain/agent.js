@@ -119,22 +119,26 @@ async function recallContext(task) {
   const kw = keywords(`${task.title} ${task.description || ''}`);
   if (!kw.length) return '';
 
-  // объединяем ключевые слова через OR — так находим записи по ЛЮБОМУ из слов
+  // объединяем ключевые слова через OR — так находим записи по ЛЮБОМУ из слов.
+  // Берём с запасом (6), затем отсекаем слабые по релевантности и оставляем топ-3.
   const q = kw.join(' or ');
-  const { data, error } = await db.rpc('search_memory', { q, max_results: 4 });
+  const { data, error } = await db.rpc('search_memory', { q, max_results: 6 });
   if (error) {
     console.error('⚠️  Поиск в памяти не удался:', error.message);
     return '';
   }
   if (!data || !data.length) return '';
 
+  const MIN_RANK = 0.01; // отсекаем почти-нулевые совпадения (шум)
   const lines = [];
   for (const m of data) {
+    if (typeof m.rank === 'number' && m.rank < MIN_RANK) continue;
     const body = (m.content || '').replace(/\s+/g, ' ').trim();
     if (!body) continue;
     // не подсовываем агенту его же текущий результат (он уже в описании задачи)
     if (task.description && task.description.includes(body.slice(0, 80))) continue;
     lines.push(`• ${m.title ? m.title + ': ' : ''}${body.slice(0, 280)}`);
+    if (lines.length >= 3) break; // не больше трёх самых релевантных
   }
   if (!lines.length) return '';
 
@@ -196,6 +200,46 @@ async function recallDialog(task, limit = 4) {
   return turns.join('\n\n');
 }
 
+// --- ЗАПИСЬ В ОБЩУЮ ПАМЯТЬ: с защитой от мусора и дублей ---
+// Память роя должна копить ЗНАНИЯ (принятые результаты), а не черновики,
+// сбои и повторы. Поэтому:
+//   • Критик передаёт Архивариусу только ПРИНЯТЫЙ результат — письмом с этим
+//     маркером в первой строке;
+//   • saveMemory отсекает явный мусор и дубли перед записью.
+const MEMORY_MARKER = '[В ПАМЯТЬ]';
+
+// Признаки «мусора»: записи-сбои и слишком короткие — пользы ноль.
+function isJunkMemory(content) {
+  const c = String(content || '').trim();
+  if (c.length < 25) return true;
+  return /\(сбой связи с LLM\)|\(без LLM\)|\(пустая рецензия\)|GROQ_API_KEY|\(сбой\b/i.test(c);
+}
+
+// Сохранить запись в память роя. Возвращает true, если реально записали.
+async function saveMemory(db, { agent_id, kind = 'fact', title, content, tags = [] }) {
+  const c = String(content || '').trim();
+  if (isJunkMemory(c)) {
+    console.log('🗑️  В память не кладу: мусор/слишком коротко.');
+    return false;
+  }
+  // дедуп: уже есть запись с таким же началом содержимого? (ловит повторные
+  // сохранения того же результата при доработках). % и _ из шаблона убираем.
+  const head = c.slice(0, 80).replace(/[%_]/g, ' ');
+  const { data: dupes } = await db
+    .from('memory').select('id').ilike('content', `${head}%`).limit(1);
+  if (dupes && dupes.length) {
+    console.log('♻️  В память не кладу: похожая запись уже есть (дубль).');
+    return false;
+  }
+  const { error } = await db.from('memory').insert({ agent_id, kind, title, content: c, tags });
+  if (error) {
+    console.error('⚠️  Не смог записать память:', error.message);
+    return false;
+  }
+  console.log('🗄️  Записал в общую память.');
+  return true;
+}
+
 // --- ПОЧТОВЫЙ ЯЩИК: читаем письма лично нам (to_id = me.id, ещё не прочитанные) ---
 async function checkMailbox(me) {
   const { data: inbox, error } = await db
@@ -222,21 +266,32 @@ async function checkMailbox(me) {
 
     // РЕАКЦИЯ: если я Архивариус — сохраняю содержимое в общую память и отвечаю отправителю.
     if (getAgent(me.name).archivist) {
-      await db.from('memory').insert({
-        agent_id: me.id,
-        kind: 'note',
-        title: `Из письма от «${fromName}»`,
-        content: letter.body,
-        tags: ['inbox', fromName],
-      });
-      console.log(`🗄️  Записал в общую память.`);
+      let saved;
+      if (letter.body.startsWith(MEMORY_MARKER)) {
+        // структурированное письмо от Критика: «[В ПАМЯТЬ]\n<заголовок>\n<текст>».
+        // Это ПРИНЯТЫЙ результат — кладём как знание (kind=fact, tag=result).
+        const rest = letter.body.slice(MEMORY_MARKER.length).trim();
+        const nl = rest.indexOf('\n');
+        const title = (nl === -1 ? rest : rest.slice(0, nl)).trim().slice(0, 200);
+        const content = (nl === -1 ? '' : rest.slice(nl + 1)).trim();
+        saved = await saveMemory(db, {
+          agent_id: me.id, kind: 'fact', title, content, tags: ['result', fromName],
+        });
+      } else {
+        // обычное письмо — сохраняем как заметку (с фильтром мусора и дедупом).
+        saved = await saveMemory(db, {
+          agent_id: me.id, kind: 'note',
+          title: `Из письма от «${fromName}»`,
+          content: letter.body, tags: ['inbox', fromName],
+        });
+      }
 
       // ответ отправителю (личное письмо обратно)
       await db.from('messages').insert({
         from_id: me.id,
         to_id: letter.from_id,
         task_id: letter.task_id ?? null,
-        body: `Принял, записал в память ✅`,
+        body: saved ? `Принял, записал в память ✅` : `Принял (в память не клал — мусор/дубль).`,
       });
       console.log(`✉️  Ответил «${fromName}».`);
     }
@@ -285,17 +340,15 @@ async function decompose(me, task) {
     `--- План (${me.name}, ${ts()}) ---\n${planText}`;
   await db.from('tasks').update({ status: 'done', description: stamped }).eq('id', task.id);
 
-  // отчитываемся Архивариусу — пусть план попадёт в память
-  const archivist = await findAgentByName(ARCHIVIST);
-  if (archivist) {
-    await db.from('messages').insert({
-      from_id: me.id,
-      to_id: archivist.id,
-      task_id: task.id,
-      body: `Разложил цель «${task.title}» на ${subtasks.length} подзадач:\n${planText}`,
-    });
-    console.log(`✉️  Отправил план лично «${ARCHIVIST}» — в память.`);
-  }
+  // сообщаем план рою (в общий мессенджер). В память план не идёт — память
+  // копит только ПРИНЯТЫЕ Критиком результаты, а не промежуточные планы.
+  await db.from('messages').insert({
+    from_id: me.id,
+    to_id: null,
+    task_id: task.id,
+    body: `Разложил цель «${task.title}» на ${subtasks.length} подзадач:\n${planText}`,
+  });
+  console.log(`🗂️  Сообщил план рою.`);
 
   await db.from('agents').update({ status: 'idle', last_seen: now() }).eq('id', me.id);
   return true;
@@ -321,14 +374,17 @@ async function reviewDoneTasks(me) {
   // НЕ рецензируем секретарские задачи (Google): возврат «на доработку» заставил бы
   // Секретаря повторить действие и создать ДУБЛИКАТ события/задачи. Помечаем их
   // отрецензированными, чтобы не висели, и пропускаем.
+  // ВАЖНО: органайзерность определяем по ИСХОДНОМУ запросу пользователя
+  // (userPartOf), а НЕ по всему описанию — иначе слово «календарь/напоминание»,
+  // случайно попавшее в РЕЗУЛЬТАТ, ложно метит обычную задачу как секретарскую
+  // и она остаётся без рецензии (а значит и без записи в память).
+  const isOrganizer = (r) => isOrganizerTask(`${r.title} ${userPartOf(r.description)}`);
   for (const r of rows || []) {
-    if (isOrganizerTask(`${r.title} ${r.description || ''}`)) {
+    if (isOrganizer(r)) {
       await db.from('tasks').update({ reviewed_at: now() }).eq('id', r.id).is('reviewed_at', null);
     }
   }
-  const task = (rows || []).find(
-    (r) => !isOrganizerTask(`${r.title} ${r.description || ''}`)
-  );
+  const task = (rows || []).find((r) => !isOrganizer(r));
   if (!task) return false;
 
   // АТОМАРНО «застолбим» рецензию: ставим reviewed_at только если он ещё пуст,
@@ -350,17 +406,11 @@ async function reviewDoneTasks(me) {
   await db.from('agents').update({ status: 'working', last_seen: now() }).eq('id', me.id);
 
   console.log(hasBrain() ? '🧠 Разбираю результат (LLM)...' : '⚙️  Просматриваю (без LLM)...');
-  const { text, verdict } = await review(task);
-  console.log(`📝 Рецензия (${verdict === 'rework' ? 'доработать' : 'принять'}):\n${text}\n`);
+  const { text, verdict, score } = await review(task);
+  console.log(`📝 Рецензия (${verdict === 'rework' ? 'доработать' : 'принять'}${score ? `, оценка ${score}/10` : ''}):\n${text}\n`);
 
-  // сохраняем рецензию в общую память роя
-  await db.from('memory').insert({
-    agent_id: me.id,
-    kind: 'note',
-    title: `Рецензия: ${task.title}`,
-    content: text,
-    tags: ['review'],
-  });
+  // Рецензию в память НЕ кладём — это мета-шум (оценка одной задачи, не знание).
+  // В память попадёт сам ПРИНЯТЫЙ результат (ниже, в ветке «принято»).
 
   // ЦИКЛ ДОРАБОТКИ: вердикт «доработать» и лимит ещё не исчерпан →
   // возвращаем задачу на доску тому же автору, подшив замечания в описание.
@@ -377,6 +427,8 @@ async function reviewDoneTasks(me) {
         reviewed_at: null, // после новой версии Критик отрецензирует заново
         rework_count: round,
         description: newDescription,
+        review_verdict: verdict, // последний вердикт (промежуточный — reviewed_at сброшен)
+        review_score: score, // оценка этой версии (1..10 или null)
       })
       .eq('id', task.id);
 
@@ -388,7 +440,14 @@ async function reviewDoneTasks(me) {
     });
     console.log(`↩️  Вернул задачу на доработку автору (раунд ${round}/${MAX_REWORK}).`);
   } else {
-    // принято (хорошо ИЛИ исчерпан лимит доработок) — задача остаётся done
+    // принято (хорошо ИЛИ исчерпан лимит доработок) — задача остаётся done.
+    // Сохраняем ФИНАЛЬНЫЙ вердикт+оценку: verdict='rework' при done+reviewed
+    // означает «принято по лимиту» — сигнал низкого качества для метрик.
+    await db
+      .from('tasks')
+      .update({ review_verdict: verdict, review_score: score })
+      .eq('id', task.id);
+
     const note =
       verdict === 'rework'
         ? ` (лимит доработок ${MAX_REWORK} исчерпан — принимаю как есть)`
@@ -399,7 +458,23 @@ async function reviewDoneTasks(me) {
       task_id: task.id,
       body: `Рецензия на «${task.title}» — принято${note}:\n${text}`,
     });
-    console.log(`✅ Принято${note}. Отправил рецензию автору и сохранил в память.`);
+
+    // В ПАМЯТЬ — только честно принятые результаты (verdict='accept', НЕ по лимиту).
+    // Передаём принятый результат Архивариусу структурированным письмом.
+    if (verdict === 'accept') {
+      const result = botPartOf(task.description);
+      const archivist = await findAgentByName(ARCHIVIST);
+      if (result && archivist && archivist.id !== me.id) {
+        await db.from('messages').insert({
+          from_id: me.id,
+          to_id: archivist.id,
+          task_id: task.id,
+          body: `${MEMORY_MARKER}\n${task.title}\n${result}`,
+        });
+        console.log('✉️  Передал принятый результат Архивариусу — в память.');
+      }
+    }
+    console.log(`✅ Принято${note}. Отправил рецензию автору.`);
   }
 
   await db.from('agents').update({ status: 'idle', last_seen: now() }).eq('id', me.id);
@@ -460,7 +535,7 @@ async function tick(me) {
     const pool =
       meDef.organizer
         ? free.data || []
-        : (free.data || []).filter((t) => !isOrganizerTask(`${t.title} ${t.description || ''}`));
+        : (free.data || []).filter((t) => !isOrganizerTask(`${t.title} ${userPartOf(t.description)}`));
     candidate = pool[0] ?? null;
   }
 
@@ -522,25 +597,16 @@ async function tick(me) {
   await db.from('tasks').update({ status: 'done', description: stamped }).eq('id', task.id);
   console.log('✅ Готово.');
 
-  // 3) отчитываемся. Если есть Архивариус (и это не я сам) — пересылаем ему РЕЗУЛЬТАТ в память.
-  const archivist = meDef.archivist ? null : await findAgentByName(ARCHIVIST);
-  if (archivist) {
-    await db.from('messages').insert({
-      from_id: me.id,
-      to_id: archivist.id, // личное письмо конкретному агенту
-      task_id: task.id,
-      body: `Выполнил задачу «${task.title}». Результат:\n${result}`,
-    });
-    console.log(`✉️  Отправил результат лично «${ARCHIVIST}» — в память.`);
-  } else {
-    await db.from('messages').insert({
-      from_id: me.id,
-      to_id: null, // всем в рой
-      task_id: task.id,
-      body: `Задачу «${task.title}» выполнил ✅\nРезультат:\n${result}`,
-    });
-    console.log('💬 Написал результат в общий мессенджер роя.');
-  }
+  // 3) отчитываемся в общий мессенджер роя. В память результат сейчас НЕ кладём —
+  //    это сделает Критик, и только если ПРИМЕТ результат (чтобы память копила
+  //    проверенные знания, а не черновики и промежуточные версии доработок).
+  await db.from('messages').insert({
+    from_id: me.id,
+    to_id: null, // всем в рой
+    task_id: task.id,
+    body: `Задачу «${task.title}» выполнил ✅\nРезультат:\n${result}`,
+  });
+  console.log('💬 Написал результат в общий мессенджер роя.');
 
   await db.from('agents').update({ status: 'idle', last_seen: now() }).eq('id', me.id);
   return true;

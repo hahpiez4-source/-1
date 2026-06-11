@@ -8,7 +8,8 @@
     "agent": "node agent.js",
     "gbrain": "node gbrain.js",
     "telegram": "node telegram.js",
-    "swarm": "node run-swarm.mjs"
+    "swarm": "node run-swarm.mjs",
+    "metrics": "node metrics.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",

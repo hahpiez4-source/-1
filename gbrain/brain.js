@@ -617,10 +617,22 @@ function parseVerdict(text) {
   return /доработать/i.test(text) ? 'rework' : 'accept';
 }
 
+// Распознать ОЦЕНКУ результата (1..10) из строки «ОЦЕНКА: N/10» / «ОЦЕНКА: N».
+// Берём последнее совпадение, зажимаем в диапазон 1..10. Нет числа → null
+// (метрика просто не учтёт эту задачу, логика роя от этого не зависит).
+function parseScore(text) {
+  const matches = [...String(text).matchAll(/оценк[аи]\s*[:\-]?\s*«?\s*(\d{1,2})\s*(?:\/\s*10)?/gi)];
+  if (!matches.length) return null;
+  const n = parseInt(matches[matches.length - 1][1], 10);
+  if (Number.isNaN(n)) return null;
+  return Math.min(10, Math.max(1, n));
+}
+
 // ------------------------------------------------------------
 // review(task) — РЕЦЕНЗИЯ на результат задачи (для Критика).
 // task.description здесь содержит результат работы другого агента.
-// Возвращает { text, verdict }, где verdict = 'accept' | 'rework'.
+// Возвращает { text, verdict, score }, где verdict = 'accept' | 'rework',
+// score = оценка 1..10 (или null, если Критик её не указал).
 // Без ключа/при сбое — аккуратная заглушка (verdict='accept', чтобы не зациклить).
 // ------------------------------------------------------------
 export async function review(task) {
@@ -628,6 +640,7 @@ export async function review(task) {
     return {
       text: `(без LLM) Результат задачи «${task.title}» просмотрен. Подключи GROQ_API_KEY для настоящей рецензии.`,
       verdict: 'accept',
+      score: null,
     };
   }
 
@@ -641,7 +654,8 @@ export async function review(task) {
     `Задача: ${task.title}\n` +
     `Результат работы:\n${task.description || '(результат пустой)'}\n\n` +
     `Дай рецензию по пунктам: 1) что хорошо; 2) что слабо/неточно; 3) что конкретно улучшить. ` +
-    `В САМОМ КОНЦЕ отдельной строкой напиши ровно один из вариантов: ` +
+    `В САМОМ КОНЦЕ двумя отдельными строками напиши ровно так:\n` +
+    `«ОЦЕНКА: N/10» (целое число от 1 до 10 — насколько результат хорош);\n` +
     `«ВЕРДИКТ: ПРИНЯТЬ» или «ВЕРДИКТ: ДОРАБОТАТЬ».`;
 
   try {
@@ -653,9 +667,9 @@ export async function review(task) {
         ],
         { temperature: 0.4, maxTokens: 800 }
       )) || `(пустая рецензия) по задаче «${task.title}».`;
-    return { text, verdict: parseVerdict(text) };
+    return { text, verdict: parseVerdict(text), score: parseScore(text) };
   } catch (e) {
     console.error('⚠️  Критик не смог обратиться к мозгу (Groq):', e.message);
-    return { text: `(сбой связи с LLM) Рецензия по «${task.title}» не сформирована.`, verdict: 'accept' };
+    return { text: `(сбой связи с LLM) Рецензия по «${task.title}» не сформирована.`, verdict: 'accept', score: null };
   }
 }
