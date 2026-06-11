@@ -44,6 +44,19 @@ export function hasWebSearch() {
 
 // Низкоуровневый вызов LLM. messages = [{role, content}, ...].
 // Возвращает строку-ответ или бросает ошибку (вызывающий решает, что делать).
+// Убираем СЛУЧАЙНЫЕ одиночные иероглифы (CJK), которые llama изредка роняет
+// в русский текст. Чистим ТОЛЬКО одиночный знак Han, не окружённый другими
+// иероглифами, — настоящие фрагменты на китайском (2+ знака подряд) не трогаем.
+// Заодно не плодим двойной пробел, если знак стоял между пробелами.
+function dropStrayCJK(text) {
+  if (!text) return text;
+  return text
+    // знак между пробелами на одной строке → оставляем РОВНО один пробел
+    .replace(/(?<![\p{Script=Han}]) [\p{Script=Han}] (?![\p{Script=Han}])/gu, ' ')
+    // знак, прилипший к тексту → просто удаляем (отступы/таблицы не трогаем)
+    .replace(/(?<![\p{Script=Han}])[\p{Script=Han}](?![\p{Script=Han}])/gu, '');
+}
+
 export async function callLLM(messages, { temperature = 0.7, maxTokens = 600, model = MODEL, raw = false, reasoningEffort, tools, toolChoice } = {}) {
   const body = { model, messages, temperature };
   // max_tokens шлём, только если задан (даём возможность не ограничивать ответ).
@@ -73,7 +86,7 @@ export async function callLLM(messages, { temperature = 0.7, maxTokens = 600, mo
       const data = await resp.json();
       // raw=true — вернуть весь ответ (нужно, чтобы прочитать executed_tools у compound).
       if (raw) return data;
-      return data?.choices?.[0]?.message?.content?.trim() || '';
+      return dropStrayCJK((data?.choices?.[0]?.message?.content || '').trim());
     }
 
     const errText = await resp.text();

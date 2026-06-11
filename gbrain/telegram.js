@@ -82,7 +82,10 @@ async function tg(method, payload, attempt = 1) {
         await sleep(wait);
         return tg(method, payload, attempt + 1);
       }
-      throw new Error(`Telegram ${method}: ${JSON.stringify(data).slice(0, 200)}`);
+      // прикрепляем код ошибки — чтобы поллер мог отдельно распознать 409 Conflict.
+      const err = new Error(`Telegram ${method}: ${JSON.stringify(data).slice(0, 200)}`);
+      err.telegramCode = data.error_code;
+      throw err;
     }
     return data.result;
   } catch (e) {
@@ -298,8 +301,21 @@ async function main() {
         await handleMessage(u.message);
       }
     } catch (e) {
-      console.error('⚠️  Ошибка getUpdates:', e.message);
-      await sleep(3000);
+      // 409 Conflict = Telegram отдаёт getUpdates ДРУГОМУ запущенному экземпляру
+      // бота (напр. локальная копия на Маке параллельно с сервером). Раньше это
+      // тонуло в общей «Ошибке getUpdates» и долбило каждые 3с — рой будто глох.
+      // Теперь: громко называем причину и ждём дольше. Рой сам оживёт, как только
+      // лишний экземпляр остановят, — падать и вмешиваться вручную не нужно.
+      if (e.telegramCode === 409) {
+        console.error(
+          '⛔ 409 Conflict: где-то запущен ВТОРОЙ экземпляр этого бота ' +
+          '(напр. локально на Маке). Останови лишний — жду 15с и пробую снова.'
+        );
+        await sleep(15000);
+      } else {
+        console.error('⚠️  Ошибка getUpdates:', e.message);
+        await sleep(3000);
+      }
     }
   }
 }
