@@ -1,0 +1,172 @@
+{
+  "id": "parserzayavok1",
+  "name": "Парсер заявок → Telegram",
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "node-manual",
+      "name": "Тест вручную",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [0, 540]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            { "field": "minutes", "minutesInterval": 10 }
+          ]
+        }
+      },
+      "id": "node-schedule",
+      "name": "Каждые 10 минут",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const cats = [\n  {category:'2',  name:'Сайты'},\n  {category:'5',  name:'Программирование'},\n  {category:'3',  name:'Дизайн'},\n  {category:'8',  name:'Тексты'},\n  {category:'32', name:'SMM'},\n  {category:'41', name:'Автоматизация'},\n  {category:'6',  name:'SEO'},\n  {category:'12', name:'Реклама'},\n];\nreturn cats.map(c => ({ json: {\n  url: 'https://www.fl.ru/rss/projects.xml?category=' + c.category,\n  source: 'FL.ru / ' + c.name\n}}));"
+      },
+      "id": "node-fl-sources",
+      "name": "Источники FL.ru",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [260, 160]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "options": {}
+      },
+      "id": "node-fl-read",
+      "name": "Читать ленты FL.ru",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1.1,
+      "position": [520, 160],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().map(i => {\n  const j = i.json;\n  const clean = (s) => ((s||'')+'').replace(/<[^>]+>/g,' ').replace(/&nbsp;/g,' ').replace(/&amp;/g,'&').replace(/\\s+/g,' ').trim();\n  return { json: {\n    id: j.link || j.guid || j.id || j.title,\n    title: clean(j.title),\n    url: j.link || j.guid || '',\n    snippet: clean(j.contentSnippet || j.content || j.description || '').slice(0,400),\n    source: 'FL.ru',\n    date: j.isoDate || j.pubDate || ''\n  }};\n});"
+      },
+      "id": "node-fl-norm",
+      "name": "Нормализовать FL.ru",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [780, 160]
+    },
+    {
+      "parameters": {
+        "jsCode": "const ch = ['frilanser_vacansii','Koteyka_Freelancer','textodromo','theyseeku','dnative_job','progjob','digitaltender','freelancetaverna','forktech','webfrl'];\nreturn ch.map(c => ({ json: {\n  url: 'https://t.me/s/' + c,\n  source: '@' + c\n}}));"
+      },
+      "id": "node-tg-sources",
+      "name": "Каналы Telegram",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [260, 440]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "outputPropertyName": "data"
+            }
+          }
+        }
+      },
+      "id": "node-tg-read",
+      "name": "Читать каналы",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [520, 440],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const out = [];\nfor (const i of $input.all()) {\n  const j = i.json;\n  let html = '';\n  for (const k of ['data','body','content','html']) { if (typeof j[k] === 'string' && j[k].length > html.length) html = j[k]; }\n  if (!html && typeof j === 'string') html = j;\n  const source = j.source || 'telegram';\n  const re = /data-post=\"([^\"]+)\"[\\s\\S]*?js-message_text[^>]*>([\\s\\S]*?)<\\/div>/g;\n  let m;\n  while ((m = re.exec(html))) {\n    const id = m[1];\n    const text = m[2].replace(/<br\\/?>/g,' ').replace(/<[^>]+>/g,' ').replace(/&nbsp;/g,' ').replace(/&amp;/g,'&').replace(/&quot;/g,'\"').replace(/\\s+/g,' ').trim();\n    if (text.length < 15) continue;\n    out.push({ json: {\n      id: 'tg/' + id,\n      title: text.slice(0,90),\n      url: 'https://t.me/' + id,\n      snippet: text.slice(0,400),\n      source: source,\n      date: ''\n    }});\n  }\n}\nreturn out;"
+      },
+      "id": "node-tg-parse",
+      "name": "Разобрать каналы",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [780, 440]
+    },
+    {
+      "parameters": {
+        "jsCode": "const KW = ['сайт','лендинг','landing','верстк','вёрстк','фронт','frontend','бэкенд','backend','tilda','тильда','wordpress','битрикс','bitrix','react','vue','html','css','javascript','веб','web','интернет-магазин','магазин','seo','api','парсер','парсинг','скрипт','автоматизац','интеграц','бот','чат-бот','чатбот','telegram','телеграм','n8n','make','zapier','нейросет','gpt','chatgpt','llm','openai','дизайн','логотип','баннер','макет','figma','фигма','иллюстрац','брендинг','фирменн','smm','смм','копирайт','текст','контент','reels','рилс','таргет','маркетолог'];\n\nconst store = $getWorkflowStaticData('global');\nstore.seen = store.seen || {};\nconst now = Date.now();\n\nconst build = (j) => {\n  let t = '🆕 ' + j.source + '\\n' + j.title;\n  if (j.snippet && j.snippet !== j.title) t += '\\n\\n' + j.snippet;\n  if (j.url) t += '\\n\\n' + j.url;\n  return { json: { text: t } };\n};\n\nconst cand = [];\nfor (const i of $input.all()) {\n  const j = i.json;\n  if (!j || !j.id) continue;\n  const src = j.source || '';\n  if (!src.startsWith('FL.ru')) {\n    const hay = ((j.title||'') + ' ' + (j.snippet||'')).toLowerCase();\n    if (!KW.some(k => hay.includes(k))) continue;\n  }\n  if (store.seen[j.id]) continue;\n  cand.push(j);\n}\n\nconst prune = () => {\n  const keys = Object.keys(store.seen);\n  if (keys.length > 5000) { keys.sort((a,b) => store.seen[a] - store.seen[b]); for (const k of keys.slice(0, keys.length - 3000)) delete store.seen[k]; }\n};\n\nconst firstRun = Object.keys(store.seen).length === 0;\n\nif (firstRun) {\n  cand.forEach(j => { store.seen[j.id] = now; });\n  prune();\n  const sample = cand[0];\n  if (!sample) return [];\n  let t = '✅ Парсер заявок запущен. Слежу за биржей FL.ru и Telegram-каналами, дальше буду присылать только НОВЫЕ заявки.\\n\\nВот пример свежей заявки:\\n\\n🆕 ' + sample.source + '\\n' + sample.title;\n  if (sample.snippet && sample.snippet !== sample.title) t += '\\n\\n' + sample.snippet;\n  if (sample.url) t += '\\n\\n' + sample.url;\n  return [{ json: { text: t } }];\n}\n\nconst MAX = 15;\nconst pick = cand.slice(0, MAX);\npick.forEach(j => { store.seen[j.id] = now; });\nprune();\nreturn pick.map(build);"
+      },
+      "id": "node-filter",
+      "name": "Фильтр, дедуп, текст",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1060, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.telegram.org/bot8975356145:AAGd342qNYeL607t6pE3EjxVE8kQb08GPhM/sendMessage",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            { "name": "chat_id", "value": "378813909" },
+            { "name": "text", "value": "={{ $json.text }}" },
+            { "name": "disable_web_page_preview", "value": "true" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-tg-send",
+      "name": "Отправить в Telegram",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1320, 300],
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Тест вручную": {
+      "main": [
+        [
+          { "node": "Источники FL.ru", "type": "main", "index": 0 },
+          { "node": "Каналы Telegram", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Каждые 10 минут": {
+      "main": [
+        [
+          { "node": "Источники FL.ru", "type": "main", "index": 0 },
+          { "node": "Каналы Telegram", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Источники FL.ru": {
+      "main": [ [ { "node": "Читать ленты FL.ru", "type": "main", "index": 0 } ] ]
+    },
+    "Читать ленты FL.ru": {
+      "main": [ [ { "node": "Нормализовать FL.ru", "type": "main", "index": 0 } ] ]
+    },
+    "Нормализовать FL.ru": {
+      "main": [ [ { "node": "Фильтр, дедуп, текст", "type": "main", "index": 0 } ] ]
+    },
+    "Каналы Telegram": {
+      "main": [ [ { "node": "Читать каналы", "type": "main", "index": 0 } ] ]
+    },
+    "Читать каналы": {
+      "main": [ [ { "node": "Разобрать каналы", "type": "main", "index": 0 } ] ]
+    },
+    "Разобрать каналы": {
+      "main": [ [ { "node": "Фильтр, дедуп, текст", "type": "main", "index": 0 } ] ]
+    },
+    "Фильтр, дедуп, текст": {
+      "main": [ [ { "node": "Отправить в Telegram", "type": "main", "index": 0 } ] ]
+    }
+  }
+}
